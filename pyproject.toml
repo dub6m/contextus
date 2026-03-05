@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contextus"
+version = "0.1.0"
+description = "A directed, weighted knowledge graph with LLM-powered traversal."
+requires-python = ">=3.10"
+dependencies = [
+    "cerebras_cloud_sdk",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
