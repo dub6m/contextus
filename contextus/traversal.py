@@ -172,7 +172,7 @@ class TraversalEngine:
     # Public entry point
     # ------------------------------------------------------------------
 
-    def query(self, query: str, graph_name: str = "", previous_context: str = "") -> TraversalResult:
+    def query(self, query: str, graph_name: str = "", previous_context: str = "", cluster_label: int = -1) -> TraversalResult:
         result = TraversalResult(query=query, graph_name=graph_name)
         session = SessionRecord()
 
@@ -192,6 +192,7 @@ class TraversalEngine:
         expansions, done = self._bfs_phase(
             query, result, session, collected_ids, queued_ids, queue, expansions, done,
             previous_context=previous_context,
+            cluster_label=cluster_label,
         )
 
         # Step 3 — Verifier reviews collected subgraph
@@ -231,6 +232,7 @@ class TraversalEngine:
             expansions, done = self._bfs_phase(
                 query, result, session, collected_ids, queued_ids, queue, expansions, done,
                 previous_context=previous_context,
+                cluster_label=cluster_label,
             )
 
             # Re-verify
@@ -265,6 +267,7 @@ class TraversalEngine:
         expansions:       int,
         done:             bool,
         previous_context: str = "",
+        cluster_label:    int = -1,
     ) -> tuple[int, bool]:
         """Run one BFS phase, updating result and session in place.
         Returns updated (expansions, done)."""
@@ -334,7 +337,7 @@ class TraversalEngine:
                     (n, e) for n, e in unvisited if n.id in visit_id_set
                 ]
                 approved.sort(
-                    key=lambda ne: ne[1].effective_weight(self.alpha),
+                    key=lambda ne: ne[1].effective_weight(self.alpha, cluster_label),
                     reverse=True,
                 )
                 for n, _ in approved:
@@ -557,7 +560,7 @@ class MultiPassEngine:
         self.max_depth  = max_depth
         self.alpha      = alpha
 
-    def query(self, query: str, graph_name: str = "") -> MultiPassResult:
+    def query(self, query: str, graph_name: str = "", cluster_label: int = -1) -> MultiPassResult:
         mp_result = MultiPassResult(query=query, graph_name=graph_name)
         previous_context = ""
 
@@ -571,6 +574,7 @@ class MultiPassEngine:
             pass_result = engine.query(
                 query, graph_name=graph_name,
                 previous_context=previous_context,
+                cluster_label=cluster_label,
             )
             mp_result.all_passes.append(pass_result)
             mp_result.passes_run = pass_num

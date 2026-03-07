@@ -101,7 +101,7 @@ def test_untouched_edge_stays_none():
     # Only observe e1
     ws.observe(make_traversal("TestGraph", [e1], verified=True))
     live_e2 = g.get_edge(e2.id)
-    assert live_e2.derived_weight is None
+    assert len(live_e2.cluster_weights) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +208,7 @@ def test_unregistered_graph_skipped_silently():
     # do NOT register g
     ws.observe(make_traversal("TestGraph", [e1], verified=True))
     # Edge should be untouched
-    assert g.get_edge(e1.id).derived_weight is None
+    assert len(g.get_edge(e1.id).cluster_weights) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +282,8 @@ def test_edge_stats_reflects_updates():
     ws.register(g)
     ws.observe(make_traversal("TestGraph", [e1], verified=True))
     stats = {s["edge_id"]: s for s in ws.edge_stats("TestGraph")}
-    assert stats[e1.id]["derived_weight"] == 1.0
+    assert -1 in stats[e1.id]["cluster_weights"]
+    assert stats[e1.id]["cluster_weights"][-1] == 1.0
 
 def test_edge_stats_unknown_graph_raises():
     ws = WeightSystem()
@@ -302,10 +303,10 @@ def test_reset_clears_derived_weights():
     ws = WeightSystem()
     ws.register(g)
     ws.observe(make_traversal("TestGraph", [e1, e2], verified=True))
-    assert g.get_edge(e1.id).derived_weight is not None
+    assert len(g.get_edge(e1.id).cluster_weights) > 0
     ws.reset_derived_weights("TestGraph")
-    assert g.get_edge(e1.id).derived_weight is None
-    assert g.get_edge(e2.id).derived_weight is None
+    assert len(g.get_edge(e1.id).cluster_weights) == 0
+    assert len(g.get_edge(e2.id).cluster_weights) == 0
 
 def test_reset_does_not_clear_history():
     g, _, _, _, e1, _ = make_graph()
@@ -333,8 +334,8 @@ def test_incomplete_graph_skips_update():
         "TestGraph", [e1, e2], verified=False,
         missing_description="Need a node covering regulatory constraints",
     ))
-    assert g.get_edge(e1.id).derived_weight is None
-    assert g.get_edge(e2.id).derived_weight is None
+    assert len(g.get_edge(e1.id).cluster_weights) == 0
+    assert len(g.get_edge(e2.id).cluster_weights) == 0
 
 
 def test_noise_only_penalises_noise_edges():
@@ -374,7 +375,7 @@ def test_mixed_missing_and_noise_applies_case3():
     # e2 (n2→n3) — both endpoints noise → penalised
     assert g.get_edge(e2.id).derived_weight == 0.0
     # e1 (n1→n2) — only one endpoint noise → skipped
-    assert g.get_edge(e1.id).derived_weight is None
+    assert len(g.get_edge(e1.id).cluster_weights) == 0
 
 
 def test_traversal_record_stores_verifier_details():
@@ -426,7 +427,7 @@ def test_observe_multi_updates_weights_from_best_only():
     # e2 from best pass should be updated (signal 1.0)
     assert g.get_edge(e2.id).derived_weight == 1.0
     # e1 from intermediate pass should NOT be updated
-    assert g.get_edge(e1.id).derived_weight is None
+    assert len(g.get_edge(e1.id).cluster_weights) == 0
 
 
 def test_observe_multi_logs_all_passes_to_history():
@@ -457,6 +458,68 @@ def test_observe_multi_logs_all_passes_to_history():
 
 
 # ---------------------------------------------------------------------------
+# Cluster-aware tests
+# ---------------------------------------------------------------------------
+
+def test_observe_uses_cluster_label_from_clusterer():
+    """After observing, edge weight should be stored under the cluster label."""
+    g, _, _, _, e1, _ = make_graph()
+    ws = WeightSystem()
+    ws.register(g)
+    ws.observe(make_traversal("TestGraph", [e1], verified=True))
+    # At minimum, some weight should exist (cluster -1 for noise queries)
+    live_e1 = g.get_edge(e1.id)
+    assert len(live_e1.cluster_weights) > 0
+    # The cluster label should be -1 (below threshold → noise)
+    assert -1 in live_e1.cluster_weights
+
+
+def test_observe_global_fallback_when_noise():
+    """When query is noise (cluster -1), weight stored under -1."""
+    g, _, _, _, e1, _ = make_graph()
+    ws = WeightSystem()
+    ws.register(g)
+    ws.observe(make_traversal("TestGraph", [e1], verified=True))
+    live_e1 = g.get_edge(e1.id)
+    assert live_e1.cluster_weights.get(-1) == 1.0
+
+
+def test_cluster_stats_returns_correct_structure():
+    """cluster_stats() should return expected keys."""
+    ws = WeightSystem()
+    stats = ws.cluster_stats()
+    assert "cluster_count" in stats
+    assert "total_queries" in stats
+    assert "queries_per_cluster" in stats
+    assert stats["cluster_count"] == 0
+    assert stats["total_queries"] == 0
+
+
+def test_reset_clears_all_cluster_weights():
+    """After reset, cluster_weights should be empty for all edges."""
+    g, _, _, _, e1, e2 = make_graph()
+    ws = WeightSystem()
+    ws.register(g)
+    ws.observe(make_traversal("TestGraph", [e1, e2], verified=True))
+    # Both edges should have weights
+    assert len(g.get_edge(e1.id).cluster_weights) > 0
+    ws.reset_derived_weights("TestGraph")
+    assert len(g.get_edge(e1.id).cluster_weights) == 0
+    assert len(g.get_edge(e2.id).cluster_weights) == 0
+
+
+def test_history_stores_cluster_label():
+    """After observe, history record should have cluster_label set."""
+    g, _, _, _, e1, _ = make_graph()
+    ws = WeightSystem()
+    ws.register(g)
+    ws.observe(make_traversal("TestGraph", [e1], verified=True))
+    record = ws.history()[0]
+    assert hasattr(record, "cluster_label")
+    assert isinstance(record.cluster_label, int)
+
+
+# ---------------------------------------------------------------------------
 # Run all
 # ---------------------------------------------------------------------------
 
@@ -484,7 +547,7 @@ if __name__ == "__main__":
         test_edge_stats_unknown_graph_raises,
         test_reset_clears_derived_weights,
         test_reset_does_not_clear_history,
-        # New three-case signal tests
+        # Three-case signal tests
         test_incomplete_graph_skips_update,
         test_noise_only_penalises_noise_edges,
         test_mixed_missing_and_noise_applies_case3,
@@ -492,6 +555,12 @@ if __name__ == "__main__":
         # observe_multi tests
         test_observe_multi_updates_weights_from_best_only,
         test_observe_multi_logs_all_passes_to_history,
+        # cluster-aware tests
+        test_observe_uses_cluster_label_from_clusterer,
+        test_observe_global_fallback_when_noise,
+        test_cluster_stats_returns_correct_structure,
+        test_reset_clears_all_cluster_weights,
+        test_history_stores_cluster_label,
     ]
 
     passed, failed = [], []

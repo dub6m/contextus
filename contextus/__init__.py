@@ -5,6 +5,7 @@ from .edge import Edge
 from .graph import Graph
 from .llm import LLMClient, CerebrasClient
 from .traversal import TraversalEngine, TraversalResult, SessionRecord, MultiPassEngine, MultiPassResult
+from .embeddings import QueryEmbedder, QueryClusterer
 from .weights import WeightSystem
 from .router import Router, RouterResult
 
@@ -19,6 +20,8 @@ __all__ = [
     "TraversalResult",
     "MultiPassEngine",
     "MultiPassResult",
+    "QueryEmbedder",
+    "QueryClusterer",
     "WeightSystem",
     "Router",
     "RouterResult",

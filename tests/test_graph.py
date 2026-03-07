@@ -49,7 +49,7 @@ def test_node_serialization_roundtrip():
 def test_edge_creation():
     e = Edge(source_id="a", target_id="b", relations=["depends_on"])
     assert e.base_weight == 1.0
-    assert e.derived_weight is None
+    assert len(e.cluster_weights) == 0
 
 def test_edge_effective_weight_no_derived():
     e = Edge(source_id="a", target_id="b", relations=["r"], base_weight=0.8)
@@ -57,7 +57,7 @@ def test_edge_effective_weight_no_derived():
 
 def test_edge_effective_weight_blended():
     e = Edge(source_id="a", target_id="b", relations=["r"], base_weight=0.8)
-    e.update_derived_weight(0.4)
+    e.update_cluster_weight(-1, 0.4)
     # alpha=0.5: 0.8 * 0.5 + 0.4 * 0.5 = 0.6
     assert abs(e.effective_weight(alpha=0.5) - 0.6) < 1e-9
 
@@ -75,9 +75,45 @@ def test_edge_invalid_weight_raises():
 
 def test_edge_serialization_roundtrip():
     e = Edge(source_id="a", target_id="b", relations=["depends_on", "clarifies"], base_weight=0.7)
+    e.update_cluster_weight(-1, 0.5)
+    e.update_cluster_weight(2, 0.9)
     e2 = Edge.from_dict(e.to_dict())
     assert e2.relations == e.relations
     assert e2.base_weight == e.base_weight
+    assert e2.cluster_weights == e.cluster_weights
+
+def test_edge_backwards_compatibility():
+    """from_dict() with old derived_weight field migrates to cluster_weights[-1]."""
+    data = {
+        "id": "test-id",
+        "source_id": "a",
+        "target_id": "b",
+        "relations": ["r"],
+        "base_weight": 0.8,
+        "derived_weight": 0.6,
+    }
+    e = Edge.from_dict(data)
+    assert e.cluster_weights.get(-1) == 0.6
+    assert e.effective_weight(alpha=0.5) == 0.8 * 0.5 + 0.6 * 0.5
+
+def test_edge_cluster_weight_invalid_raises():
+    e = Edge(source_id="a", target_id="b", relations=["r"])
+    with pytest.raises(ValueError):
+        e.update_cluster_weight(-1, 1.5)
+    with pytest.raises(ValueError):
+        e.update_cluster_weight(-1, -0.1)
+
+def test_edge_effective_weight_falls_back_to_global():
+    """Specific cluster has no weight, falls back to cluster -1 (global)."""
+    e = Edge(source_id="a", target_id="b", relations=["r"], base_weight=0.8)
+    e.update_cluster_weight(-1, 0.6)
+    # Asking for cluster 5 which doesn't exist — falls back to -1
+    assert abs(e.effective_weight(alpha=0.5, cluster_label=5) - (0.8 * 0.5 + 0.6 * 0.5)) < 1e-9
+
+def test_edge_effective_weight_falls_back_to_base():
+    """No cluster weights at all, returns base_weight."""
+    e = Edge(source_id="a", target_id="b", relations=["r"], base_weight=0.8)
+    assert e.effective_weight(alpha=0.5, cluster_label=5) == 0.8
 
 
 # ------------------------------------------------------------------
