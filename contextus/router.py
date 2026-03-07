@@ -179,7 +179,7 @@ class Router:
     # Public entry point
     # ------------------------------------------------------------------
 
-    def query(self, query: str) -> RouterResult:
+    def query(self, query: str, cluster_label: int = -1) -> RouterResult:
         result = RouterResult(query=query)
 
         if not self._graphs:
@@ -206,7 +206,7 @@ class Router:
                 max_depth=self.max_depth,
                 alpha=self.alpha,
             )
-            traversal = engine.query(query, graph_name=name)
+            traversal = engine.query(query, graph_name=name, cluster_label=cluster_label)
             result.traversals.append(traversal)
 
         # Step 3 — merge results if more than one graph was queried

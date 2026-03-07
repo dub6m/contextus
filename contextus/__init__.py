@@ -8,6 +8,7 @@ from .traversal import TraversalEngine, TraversalResult, SessionRecord, MultiPas
 from .embeddings import QueryEmbedder, QueryClusterer
 from .weights import WeightSystem
 from .router import Router, RouterResult
+from .store import GraphStore
 
 __all__ = [
     "Node",
@@ -25,4 +26,5 @@ __all__ = [
     "WeightSystem",
     "Router",
     "RouterResult",
+    "GraphStore",
 ]
