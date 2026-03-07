@@ -7,7 +7,7 @@ can be tested without a live API key.
 import json
 from contextus import Node, NodeType, Edge, Graph
 from contextus.llm import LLMClient, LLMResponse
-from contextus.traversal import TraversalEngine, TraversalResult, _parse_json
+from contextus.traversal import TraversalEngine, TraversalResult, SessionRecord, _parse_json
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +201,14 @@ def test_verifier_marks_incomplete():
             "missing_description": "Missing constraint node about sorted array requirement.",
             "note": "incomplete"
         }),
+        # Backtracking discovers unchosen neighbours and re-verifies
+        # Second verifier also says incomplete
+        json.dumps({
+            "complete": False,
+            "noise_ids": [],
+            "missing_description": "Still missing something.",
+            "note": "still incomplete"
+        }),
     ])
     engine = TraversalEngine(graph=g, llm=mock)
     result = engine.query("What are all the requirements to use binary search?")
@@ -263,6 +271,341 @@ def test_max_depth_stops_runaway_traversal():
 
 
 # ---------------------------------------------------------------------------
+# SessionRecord tests
+# ---------------------------------------------------------------------------
+
+def test_session_record_initialises_empty():
+    sr = SessionRecord()
+    assert sr.attempted_edges == {}
+    assert sr.unchosen_neighbours == {}
+    assert sr.decision_point_order == []
+
+def test_session_record_is_not_persisted():
+    """Two separate calls to engine.query() do not share session state."""
+    g, n_def, n_beh, n_con, n_ex = build_binary_search_graph()
+
+    responses = (
+        # --- First query ---
+        [
+            # Anchor
+            json.dumps({"anchor_id": n_def.id, "reason": "central"}),
+            # Step from n_def: visit behavior only (leaves constraint + example unchosen)
+            json.dumps({"visit": [n_beh.id], "done": False, "reason": "enough"}),
+            # Step from n_beh: done
+            json.dumps({"visit": [], "done": True, "reason": "done"}),
+            # Verifier: complete
+            json.dumps({"complete": True, "noise_ids": [], "missing_description": "", "note": "ok"}),
+        ]
+        +
+        # --- Second query ---
+        [
+            # Anchor
+            json.dumps({"anchor_id": n_def.id, "reason": "central"}),
+            # Step from n_def: visit constraint only
+            json.dumps({"visit": [n_con.id], "done": False, "reason": "enough"}),
+            # Step from n_con: done (n_con has inbound from n_beh but n_beh not queued)
+            json.dumps({"visit": [], "done": True, "reason": "done"}),
+            # Verifier: complete
+            json.dumps({"complete": True, "noise_ids": [], "missing_description": "", "note": "ok"}),
+        ]
+    )
+    mock = MockLLMClient(responses)
+    engine = TraversalEngine(graph=g, llm=mock, max_depth=5)
+
+    r1 = engine.query("first query")
+    r2 = engine.query("second query")
+
+    # Each query should only have nodes from its own session
+    r1_labels = {n.label for n in r1.nodes}
+    r2_labels = {n.label for n in r2.nodes}
+
+    assert "O(log n) Complexity" in r1_labels
+    assert "Sorted Array Requirement" not in r1_labels
+
+    assert "Sorted Array Requirement" in r2_labels
+    assert "O(log n) Complexity" not in r2_labels
+
+
+# ---------------------------------------------------------------------------
+# Backtracking graph fixture
+# ---------------------------------------------------------------------------
+
+def build_backtrack_graph():
+    """
+    Graph for backtracking tests:
+        A (definition)
+        ├── B (behavior)    ← correct path, leads to verified result
+        ├── C (behavior)    ← wrong path, leads to unverified result
+        └── D (constraint)  ← backtrack target
+    """
+    g = Graph(name="Backtrack Test", description="For backtracking tests.")
+
+    a = g.add_node(Node(
+        label="A",
+        type=NodeType.DEFINITION,
+        body="Node A is the root concept.",
+        scope="Root node for backtracking test.",
+    ))
+    b = g.add_node(Node(
+        label="B",
+        type=NodeType.BEHAVIOR,
+        body="Node B is the correct destination.",
+        scope="Correct path target.",
+    ))
+    c = g.add_node(Node(
+        label="C",
+        type=NodeType.BEHAVIOR,
+        body="Node C is a wrong turn.",
+        scope="Wrong path target.",
+    ))
+    d = g.add_node(Node(
+        label="D",
+        type=NodeType.CONSTRAINT,
+        body="Node D is the backtrack target.",
+        scope="Backtrack target.",
+    ))
+
+    g.add_edge(Edge(source_id=a.id, target_id=b.id, relations=["has_behavior"], base_weight=0.9))
+    g.add_edge(Edge(source_id=a.id, target_id=c.id, relations=["has_behavior"], base_weight=0.8))
+    g.add_edge(Edge(source_id=a.id, target_id=d.id, relations=["has_constraint"], base_weight=0.7))
+
+    return g, a, b, c, d
+
+
+# ---------------------------------------------------------------------------
+# Backtracking tests
+# ---------------------------------------------------------------------------
+
+def test_backtracking_triggered_on_missing_description():
+    """
+    First pass: Collector visits C (wrong path). Verifier says unverified + missing.
+    Backtracking: picks up D (unchosen). Verifier says verified.
+    """
+    g, a, b, c, d = build_backtrack_graph()
+    mock = MockLLMClient([
+        # Anchor → A
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        # Step from A: visit only C (leaves B and D unchosen)
+        json.dumps({"visit": [c.id], "done": False, "reason": "try C first"}),
+        # Step from C: no unvisited neighbors, so no collector call needed → done
+        # (C has no outbound edges to unvisited nodes → BFS ends)
+        # Verifier 1: unverified, missing description
+        json.dumps({
+            "complete": False,
+            "noise_ids": [],
+            "missing_description": "Missing constraint D.",
+            "note": "incomplete"
+        }),
+        # Backtracking: B and D are enqueued from A's unchosen list
+        # Step from B: no further neighbors
+        # Step from D: no further neighbors
+        # Verifier 2: verified
+        json.dumps({
+            "complete": True,
+            "noise_ids": [],
+            "missing_description": "",
+            "note": "all good"
+        }),
+    ])
+    engine = TraversalEngine(graph=g, llm=mock, max_depth=10)
+    result = engine.query("Explain A fully")
+    assert result.verified is True
+    assert result.backtrack_count == 1
+
+def test_backtracking_not_triggered_on_noise_only():
+    """
+    Verifier returns unverified with noise_ids but empty missing_description.
+    Backtracking should NOT occur.
+    """
+    g, a, b, c, d = build_backtrack_graph()
+    mock = MockLLMClient([
+        # Anchor → A
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        # Step from A: visit B and C (leaves D unchosen)
+        json.dumps({"visit": [b.id, c.id], "done": False, "reason": "grab B and C"}),
+        # BFS continues — B and C have no unvisited neighbors
+        # Verifier: noise only, no missing
+        json.dumps({
+            "complete": False,
+            "noise_ids": [c.id],
+            "missing_description": "",
+            "note": "C is noise"
+        }),
+    ])
+    engine = TraversalEngine(graph=g, llm=mock, max_depth=10)
+    result = engine.query("What is A?")
+    assert result.backtrack_count == 0
+
+def test_backtracking_respects_max_depth():
+    """max_depth=2 should prevent backtracking from running further expansions."""
+    g, a, b, c, d = build_backtrack_graph()
+    mock = MockLLMClient([
+        # Anchor → A
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        # Step from A: visit C only (1 expansion for A, leaves B+D unchosen)
+        json.dumps({"visit": [c.id], "done": False, "reason": "try C"}),
+        # C expansion (2nd expansion — now at max_depth=2)
+        # C has no unvisited neighbors
+        # Verifier 1: unverified + missing
+        json.dumps({
+            "complete": False,
+            "noise_ids": [],
+            "missing_description": "Missing D.",
+            "note": "incomplete"
+        }),
+        # Backtracking would try but max_depth already reached → no further expansion
+        # (the while loop condition `expansions < self.max_depth` fails)
+    ])
+    engine = TraversalEngine(graph=g, llm=mock, max_depth=2)
+    result = engine.query("Explain A")
+    # Should not have backtracked because depth is exhausted
+    assert result.backtrack_count == 0
+
+def test_backtracking_skips_already_collected_nodes():
+    """Nodes already in collected_ids are not re-expanded during backtracking."""
+    g, a, b, c, d = build_backtrack_graph()
+    mock = MockLLMClient([
+        # Anchor → A
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        # Step from A: visit B and C (leaves D unchosen)
+        json.dumps({"visit": [b.id, c.id], "done": False, "reason": "visit B and C"}),
+        # B expansion: no unvisited neighbors
+        # C expansion: no unvisited neighbors
+        # Verifier 1: unverified, missing D
+        json.dumps({
+            "complete": False,
+            "noise_ids": [],
+            "missing_description": "Missing D.",
+            "note": "incomplete"
+        }),
+        # Backtracking: D is enqueued. B and C already collected → skipped.
+        # D expansion: no unvisited neighbors
+        # Verifier 2: verified
+        json.dumps({
+            "complete": True,
+            "noise_ids": [],
+            "missing_description": "",
+            "note": "complete"
+        }),
+    ])
+    engine = TraversalEngine(graph=g, llm=mock, max_depth=10)
+    result = engine.query("Explain A fully")
+    assert result.verified is True
+    # D should be in the result, B and C should also be there (collected earlier)
+    labels = {n.label for n in result.nodes}
+    assert "D" in labels
+    assert "B" in labels
+    assert "C" in labels
+
+def test_stub_node_not_expanded():
+    """Stub node is added to result but _collector_step is never called for it."""
+    g = Graph(name="Stub Test", description="Test stub behavior.")
+
+    root = g.add_node(Node(
+        label="Root",
+        type=NodeType.DEFINITION,
+        body="Root concept.",
+        scope="Root.",
+    ))
+    stub = g.add_node(Node(
+        label="External Concept",
+        type=NodeType.STUB,
+        body="External — see graph:other.",
+        scope="Stub placeholder.",
+    ))
+    leaf = g.add_node(Node(
+        label="Leaf",
+        type=NodeType.BEHAVIOR,
+        body="A real leaf node.",
+        scope="Leaf behavior.",
+    ))
+
+    g.add_edge(Edge(source_id=root.id, target_id=stub.id, relations=["references"], base_weight=0.5))
+    g.add_edge(Edge(source_id=stub.id, target_id=leaf.id, relations=["details"], base_weight=0.6))
+
+    mock = MockLLMClient([
+        # Anchor → root
+        json.dumps({"anchor_id": root.id, "reason": "root"}),
+        # Step from root: visit stub
+        json.dumps({"visit": [stub.id], "done": False, "reason": "need stub"}),
+        # Stub is dequeued but NOT expanded — no collector call for it.
+        # BFS ends because nothing else is in the queue.
+        # Verifier
+        json.dumps({"complete": True, "noise_ids": [], "missing_description": "", "note": "ok"}),
+    ])
+    engine = TraversalEngine(graph=g, llm=mock, max_depth=10)
+    result = engine.query("What is root?")
+
+    # Stub should be collected
+    labels = {n.label for n in result.nodes}
+    assert "External Concept" in labels
+
+    # Leaf should NOT be collected — stub was not expanded
+    assert "Leaf" not in labels
+
+
+# ---------------------------------------------------------------------------
+# Return value tests
+# ---------------------------------------------------------------------------
+
+def test_returns_verified_result_when_backtracking_succeeds():
+    """When backtracking produces a verified result, that's what we get back."""
+    g, a, b, c, d = build_backtrack_graph()
+    mock = MockLLMClient([
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        # Visit only C
+        json.dumps({"visit": [c.id], "done": False, "reason": "try C"}),
+        # Verifier 1: missing
+        json.dumps({
+            "complete": False,
+            "noise_ids": [],
+            "missing_description": "Missing D.",
+            "note": "incomplete"
+        }),
+        # Backtracking picks up B + D
+        # Verifier 2: verified
+        json.dumps({
+            "complete": True,
+            "noise_ids": [],
+            "missing_description": "",
+            "note": "now complete"
+        }),
+    ])
+    engine = TraversalEngine(graph=g, llm=mock, max_depth=10)
+    result = engine.query("Explain A")
+    assert result.verified is True
+
+def test_returns_most_complete_result_when_all_unverified():
+    """When no pass verifies, return the result with the most nodes."""
+    g, a, b, c, d = build_backtrack_graph()
+    mock = MockLLMClient([
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        # Visit only C
+        json.dumps({"visit": [c.id], "done": False, "reason": "try C"}),
+        # Verifier 1: missing (2 nodes: A, C)
+        json.dumps({
+            "complete": False,
+            "noise_ids": [],
+            "missing_description": "Missing D.",
+            "note": "incomplete"
+        }),
+        # Backtracking picks up B + D (now 4 nodes: A, C, B, D)
+        # Verifier 2: still unverified but more complete
+        json.dumps({
+            "complete": False,
+            "noise_ids": [],
+            "missing_description": "Still missing something.",
+            "note": "still incomplete"
+        }),
+    ])
+    engine = TraversalEngine(graph=g, llm=mock, max_depth=10)
+    result = engine.query("Explain A fully")
+    assert result.verified is False
+    # Should have all 4 nodes (the most complete result)
+    assert len(result.nodes) == 4
+
+
+# ---------------------------------------------------------------------------
 # Run all
 # ---------------------------------------------------------------------------
 
@@ -281,6 +624,15 @@ if __name__ == "__main__":
         test_verifier_marks_complete,
         test_edges_collected_between_visited_nodes,
         test_max_depth_stops_runaway_traversal,
+        test_session_record_initialises_empty,
+        test_session_record_is_not_persisted,
+        test_backtracking_triggered_on_missing_description,
+        test_backtracking_not_triggered_on_noise_only,
+        test_backtracking_respects_max_depth,
+        test_backtracking_skips_already_collected_nodes,
+        test_stub_node_not_expanded,
+        test_returns_verified_result_when_backtracking_succeeds,
+        test_returns_most_complete_result_when_all_unverified,
     ]
 
     passed, failed = [], []
@@ -295,3 +647,4 @@ if __name__ == "__main__":
     print(f"\n{len(passed)}/{len(tests)} passed")
     for name, tb in failed:
         print(f"\nFAIL: {name}\n{tb}")
+

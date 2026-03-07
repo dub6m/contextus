@@ -4,7 +4,7 @@ from .node import Node, NodeType
 from .edge import Edge
 from .graph import Graph
 from .llm import LLMClient, CerebrasClient
-from .traversal import TraversalEngine, TraversalResult
+from .traversal import TraversalEngine, TraversalResult, SessionRecord
 from .weights import WeightSystem
 from .router import Router, RouterResult
 

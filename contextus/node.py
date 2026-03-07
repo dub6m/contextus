@@ -13,6 +13,7 @@ class NodeType(str, Enum):
     RELATION    = "relation"     # a concept that is itself a relationship
     PROCEDURE   = "procedure"    # steps to do something
     EXCEPTION   = "exception"    # where a rule/behavior breaks down
+    STUB        = "stub"         # lightweight placeholder owned by another graph
 
 
 @dataclass
@@ -28,6 +29,8 @@ class Node:
     scope    : ONE sentence — what this node is and is NOT about.
                This is the field the traversal engine reads first.
                Write it like a contract: precise, unambiguous.
+    subtype  : optional specialisation — only valid for EXAMPLE nodes
+               ("concrete" or "analogy"); must be None for all others
     aliases  : other names/terms this concept is known by
     metadata : arbitrary key-value store (source, author, timestamp, etc.)
     id       : stable unique identifier — auto-generated if not supplied
@@ -37,23 +40,42 @@ class Node:
     type:     NodeType
     body:     str
     scope:    str
+    subtype:  str | None          = None
     aliases:  list[str]          = field(default_factory=list)
     metadata: dict[str, Any]     = field(default_factory=dict)
     id:       str                = field(default_factory=lambda: str(uuid.uuid4()))
 
     def __post_init__(self):
+        if isinstance(self.type, str):
+            self.type = NodeType(self.type)
         if not self.label.strip():
             raise ValueError("Node label cannot be empty.")
         if not self.scope.strip():
             raise ValueError("Node scope cannot be empty — it is load-bearing for traversal.")
-        if not self.body.strip():
+        if self.type != NodeType.STUB and not self.body.strip():
             raise ValueError("Node body cannot be empty.")
-        if isinstance(self.type, str):
-            self.type = NodeType(self.type)
+        # subtype validation
+        if self.type == NodeType.EXAMPLE:
+            if self.subtype is not None and self.subtype not in ("concrete", "analogy"):
+                raise ValueError(
+                    f"Invalid subtype '{self.subtype}' for example node. "
+                    f"Must be 'concrete', 'analogy', or None."
+                )
+        else:
+            if self.subtype is not None:
+                raise ValueError(
+                    "subtype is only valid for example nodes."
+                )
+
+    @property
+    def is_stub(self) -> bool:
+        """True when this node is a cross-graph stub placeholder."""
+        return self.type == NodeType.STUB
 
     def summary(self) -> str:
         """One-liner the traversal engine uses to decide relevance without reading body."""
-        return f"[{self.type.value}] {self.label} — {self.scope}"
+        tag = f"{self.type.value}:{self.subtype}" if self.subtype else self.type.value
+        return f"[{tag}] {self.label} — {self.scope}"
 
     def to_dict(self) -> dict:
         return {
@@ -62,6 +84,7 @@ class Node:
             "type":     self.type.value,
             "body":     self.body,
             "scope":    self.scope,
+            "subtype":  self.subtype,
             "aliases":  self.aliases,
             "metadata": self.metadata,
         }
@@ -74,6 +97,7 @@ class Node:
             type=NodeType(data["type"]),
             body=data["body"],
             scope=data["scope"],
+            subtype=data.get("subtype"),
             aliases=data.get("aliases", []),
             metadata=data.get("metadata", {}),
         )

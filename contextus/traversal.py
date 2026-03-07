@@ -2,9 +2,10 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from copy import deepcopy
 
 from .graph import Graph
-from .node import Node
+from .node import Node, NodeType
 from .edge import Edge
 from .llm import LLMClient
 
@@ -28,6 +29,7 @@ class TraversalResult:
     verifier_note:       str             = ""
     noise_ids:           list[str]       = field(default_factory=list)
     missing_description: str             = ""
+    backtrack_count:     int             = 0
 
     def node_ids(self) -> set[str]:
         return {n.id for n in self.nodes}
@@ -43,6 +45,25 @@ class TraversalResult:
         if self.verifier_note:
             lines.append(f"Verifier  : {self.verifier_note}")
         return "\n".join(lines)
+
+
+@dataclass
+class SessionRecord:
+    """
+    Tracks traversal state within a single query session.
+    Created at query start, discarded at query end.
+    Never persisted. Never affects derived weights.
+    """
+    # All edges attempted in this session: edge_id -> outcome
+    # outcome is "collected", "rejected_by_collector", or "dead_end"
+    attempted_edges: dict[str, str] = field(default_factory=dict)
+
+    # Decision points: node_id -> list of neighbour node ids NOT chosen by Collector
+    # These are available for backtracking
+    unchosen_neighbours: dict[str, list[str]] = field(default_factory=dict)
+
+    # Order in which decision points were made, for backtracking in reverse order
+    decision_point_order: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +174,7 @@ class TraversalEngine:
 
     def query(self, query: str, graph_name: str = "") -> TraversalResult:
         result = TraversalResult(query=query, graph_name=graph_name)
+        session = SessionRecord()
 
         # Step 1 — find anchor node
         anchor = self._find_anchor(query)
@@ -161,16 +183,88 @@ class TraversalEngine:
             return result
 
         # Step 2 — BFS traversal driven by Collector
-        #
-        # collected_ids : nodes already added to result
-        # queued_ids    : nodes scheduled for expansion (to avoid duplicate enqueuing)
-        # queue         : ordered list of node ids to expand next
-        #
         collected_ids: set[str] = set()
         queued_ids:    set[str] = {anchor.id}
         queue:         list[str] = [anchor.id]
         expansions = 0
         done = False
+
+        expansions, done = self._bfs_phase(
+            query, result, session, collected_ids, queued_ids, queue, expansions, done
+        )
+
+        # Step 3 — Verifier reviews collected subgraph
+        result = self._verify(query, result)
+
+        if result.verified:
+            return result
+
+        # Step 4 — Backtracking if unverified with missing coverage
+        best_result = deepcopy(result)
+
+        while (
+            not result.verified
+            and result.missing_description
+            and expansions < self.max_depth
+        ):
+            # Find the most recent decision point with unchosen neighbours
+            backtrack_node_id = None
+            for dp_id in reversed(session.decision_point_order):
+                if session.unchosen_neighbours.get(dp_id):
+                    backtrack_node_id = dp_id
+                    break
+
+            if backtrack_node_id is None:
+                break  # No more decision points to try
+
+            result.backtrack_count += 1
+
+            # Enqueue unchosen neighbours from this decision point
+            unchosen = session.unchosen_neighbours.pop(backtrack_node_id)
+            for nid in unchosen:
+                if nid not in collected_ids and nid not in queued_ids:
+                    queued_ids.add(nid)
+                    queue.append(nid)
+
+            # Continue BFS from where we left off
+            expansions, done = self._bfs_phase(
+                query, result, session, collected_ids, queued_ids, queue, expansions, done
+            )
+
+            # Re-verify
+            result = self._verify(query, result)
+
+            # Track the best result (most nodes after noise removal)
+            if len(result.nodes) > len(best_result.nodes):
+                best_result = deepcopy(result)
+
+            if result.verified:
+                return result
+
+        # Return the best result if nothing verified
+        if not result.verified and len(best_result.nodes) > len(result.nodes):
+            best_result.backtrack_count = result.backtrack_count
+            return best_result
+
+        return result
+
+    # ------------------------------------------------------------------
+    # BFS phase (used by query and backtracking)
+    # ------------------------------------------------------------------
+
+    def _bfs_phase(
+        self,
+        query:         str,
+        result:        TraversalResult,
+        session:       SessionRecord,
+        collected_ids: set[str],
+        queued_ids:    set[str],
+        queue:         list[str],
+        expansions:    int,
+        done:          bool,
+    ) -> tuple[int, bool]:
+        """Run one BFS phase, updating result and session in place.
+        Returns updated (expansions, done)."""
 
         while queue and expansions < self.max_depth and not done:
             node_id = queue.pop(0)
@@ -188,9 +282,16 @@ class TraversalEngine:
                 for edge in self.graph.get_edge_between(existing_id, node_id):
                     if edge not in result.edges:
                         result.edges.append(edge)
+                    session.attempted_edges[edge.id] = "collected"
                 for edge in self.graph.get_edge_between(node_id, existing_id):
                     if edge not in result.edges:
                         result.edges.append(edge)
+                    session.attempted_edges[edge.id] = "collected"
+
+            # Stub nodes: collect as boundary markers but never expand
+            if node.is_stub:
+                expansions += 1
+                continue
 
             # Ask Collector which neighbors to enqueue
             neighbors = self.graph.neighbors_all(node_id)
@@ -209,10 +310,24 @@ class TraversalEngine:
             )
             result.reasoning = reason
 
+            # Record edge outcomes
+            visit_id_set = set(visit_ids)
+            for n, e in unvisited:
+                if n.id in visit_id_set:
+                    session.attempted_edges[e.id] = "collected"
+                else:
+                    session.attempted_edges[e.id] = "rejected_by_collector"
+
+            # Record unchosen neighbours for backtracking
+            unchosen = [n.id for n, _ in unvisited if n.id not in visit_id_set]
+            if unchosen:
+                session.unchosen_neighbours[node_id] = unchosen
+                session.decision_point_order.append(node_id)
+
             if not done and visit_ids:
                 # Weight-sort approved neighbors before enqueuing
                 approved = [
-                    (n, e) for n, e in unvisited if n.id in visit_ids
+                    (n, e) for n, e in unvisited if n.id in visit_id_set
                 ]
                 approved.sort(
                     key=lambda ne: ne[1].effective_weight(self.alpha),
@@ -222,9 +337,7 @@ class TraversalEngine:
                     queued_ids.add(n.id)
                     queue.append(n.id)
 
-        # Step 3 — Verifier reviews collected subgraph
-        result = self._verify(query, result)
-        return result
+        return expansions, done
 
     # ------------------------------------------------------------------
     # Collector: anchor selection
