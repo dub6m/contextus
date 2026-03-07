@@ -4,7 +4,7 @@ from .node import Node, NodeType
 from .edge import Edge
 from .graph import Graph
 from .llm import LLMClient, CerebrasClient
-from .traversal import TraversalEngine, TraversalResult, SessionRecord
+from .traversal import TraversalEngine, TraversalResult, SessionRecord, MultiPassEngine, MultiPassResult
 from .weights import WeightSystem
 from .router import Router, RouterResult
 
@@ -17,6 +17,8 @@ __all__ = [
     "CerebrasClient",
     "TraversalEngine",
     "TraversalResult",
+    "MultiPassEngine",
+    "MultiPassResult",
     "WeightSystem",
     "Router",
     "RouterResult",

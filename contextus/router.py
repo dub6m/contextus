@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 from .graph import Graph
 from .llm import LLMClient
-from .traversal import TraversalEngine, TraversalResult
+from .traversal import MultiPassEngine, MultiPassResult
 
 
 # ---------------------------------------------------------------------------
@@ -17,11 +17,11 @@ class RouterResult:
     """
     Aggregated result across all graphs the router dispatched to.
 
-    Each graph that was queried contributes a TraversalResult.
+    Each graph that was queried contributes a MultiPassResult.
     The router also records which graphs were skipped and why.
     """
     query:           str
-    traversals:      list[TraversalResult]  = field(default_factory=list)
+    traversals:      list[MultiPassResult]  = field(default_factory=list)
     skipped_graphs:  list[str]              = field(default_factory=list)  # graph names
     dispatch_reason: str                    = ""
 
@@ -35,7 +35,7 @@ class RouterResult:
         seen = set()
         nodes = []
         for t in self.traversals:
-            for n in t.nodes:
+            for n in t.nodes():
                 if n.id not in seen:
                     seen.add(n.id)
                     nodes.append(n)
@@ -46,7 +46,7 @@ class RouterResult:
         seen = set()
         edges = []
         for t in self.traversals:
-            for e in t.edges:
+            for e in t.edges():
                 if e.id not in seen:
                     seen.add(e.id)
                     edges.append(e)
@@ -63,7 +63,7 @@ class RouterResult:
         ]
         for t in self.traversals:
             lines.append(f"\n  [{t.query[:40]}...]")
-            for n in t.nodes:
+            for n in t.nodes():
                 lines.append(f"    - {n.summary()}")
         return "\n".join(lines)
 
@@ -130,21 +130,24 @@ class Router:
 
     Parameters
     ----------
-    llm       : any LLMClient — same provider used for traversal
-    max_depth : passed through to each TraversalEngine
-    alpha     : edge weight blend factor, passed through to each TraversalEngine
+    llm        : any LLMClient — same provider used for traversal
+    max_passes : maximum multi-pass traversal attempts per graph
+    max_depth  : passed through to each TraversalEngine
+    alpha      : edge weight blend factor, passed through to each TraversalEngine
     """
 
     def __init__(
         self,
-        llm:       LLMClient,
-        max_depth: int   = 10,
-        alpha:     float = 0.5,
+        llm:        LLMClient,
+        max_passes: int   = 3,
+        max_depth:  int   = 10,
+        alpha:      float = 0.5,
     ):
-        self.llm       = llm
-        self.max_depth = max_depth
-        self.alpha     = alpha
-        self._graphs:  dict[str, Graph] = {}   # name -> Graph
+        self.llm        = llm
+        self.max_passes = max_passes
+        self.max_depth  = max_depth
+        self.alpha      = alpha
+        self._graphs:   dict[str, Graph] = {}   # name -> Graph
 
     # ------------------------------------------------------------------
     # Graph registry
@@ -196,9 +199,10 @@ class Router:
         # Step 2 — run traversal on each selected graph
         for name in selected_names:
             graph = self._graphs[name]
-            engine = TraversalEngine(
+            engine = MultiPassEngine(
                 graph=graph,
                 llm=self.llm,
+                max_passes=self.max_passes,
                 max_depth=self.max_depth,
                 alpha=self.alpha,
             )
@@ -254,7 +258,7 @@ class Router:
         node_list = []
         for t_idx, t in enumerate(result.traversals):
             graph_name = t.graph_name
-            for n in t.nodes:
+            for n in t.nodes():
                 node_list.append(
                     f'  {{"id": "{n.id}", "graph": "{graph_name}", '
                     f'"type": "{n.type.value}", "label": "{n.label}", "scope": "{n.scope}"}}'
@@ -283,12 +287,14 @@ class Router:
 
         # Remove from each traversal result
         for t in result.traversals:
-            t.nodes = [n for n in t.nodes if n.id not in ids_to_remove]
-            t.edges = [
-                e for e in t.edges
-                if e.source_id not in ids_to_remove
-                and e.target_id not in ids_to_remove
-            ]
+            best = t.best
+            if best:
+                best.nodes = [n for n in best.nodes if n.id not in ids_to_remove]
+                best.edges = [
+                    e for e in best.edges
+                    if e.source_id not in ids_to_remove
+                    and e.target_id not in ids_to_remove
+                ]
 
         return result
 

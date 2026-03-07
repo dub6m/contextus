@@ -294,13 +294,49 @@ def test_router_result_verified_false_when_any_unverified():
     assert result.verified == False
 
 def test_all_nodes_deduplicates():
-    from contextus.traversal import TraversalResult
+    from contextus.traversal import TraversalResult, MultiPassResult
     g, nodes = make_algorithms_graph()
     n = nodes["bsearch"]
-    t1 = TraversalResult(query="q", nodes=[n], verified=True)
-    t2 = TraversalResult(query="q", nodes=[n], verified=True)
-    rr = RouterResult(query="q", traversals=[t1, t2])
+    tr1 = TraversalResult(query="q", nodes=[n], verified=True)
+    tr2 = TraversalResult(query="q", nodes=[n], verified=True)
+    mp1 = MultiPassResult(query="q", best=tr1, passes_run=1, verified=True, all_passes=[tr1])
+    mp2 = MultiPassResult(query="q", best=tr2, passes_run=1, verified=True, all_passes=[tr2])
+    rr = RouterResult(query="q", traversals=[mp1, mp2])
     assert len(rr.all_nodes()) == 1
+
+
+# ---------------------------------------------------------------------------
+# max_passes passthrough test
+# ---------------------------------------------------------------------------
+
+def test_router_passes_max_passes_to_engine():
+    """Router(max_passes=2) results in at most 2 passes per graph."""
+    g_algo, nodes_algo = make_algorithms_graph()
+    bsearch_id = nodes_algo["bsearch"].id
+
+    # Two passes per graph, each unverified
+    mock = MockLLMClient([
+        # Router dispatch
+        json.dumps({"selected": ["Algorithms"], "reason": "relevant"}),
+        # Pass 1: anchor + collector done + verifier unverified
+        json.dumps({"anchor_id": bsearch_id, "reason": "central"}),
+        json.dumps({"visit": [], "done": True, "reason": "done"}),
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Missing.", "note": "incomplete"}),
+        # Backtracking: unchosen neighbours picked up, still unverified
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Still missing.", "note": "still incomplete"}),
+        # Pass 2: anchor + collector done + verifier unverified
+        json.dumps({"anchor_id": bsearch_id, "reason": "central"}),
+        json.dumps({"visit": [], "done": True, "reason": "done"}),
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Missing.", "note": "incomplete"}),
+        # Backtracking
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Still missing.", "note": "still incomplete"}),
+        # No pass 3 should happen
+    ])
+    router = Router(llm=mock, max_passes=2)
+    router.register(g_algo)
+    result = router.query("What is binary search?")
+    assert len(result.traversals) == 1
+    assert result.traversals[0].passes_run <= 2
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +359,7 @@ if __name__ == "__main__":
         test_router_result_verified_true_when_all_verified,
         test_router_result_verified_false_when_any_unverified,
         test_all_nodes_deduplicates,
+        test_router_passes_max_passes_to_engine,
     ]
 
     passed, failed = [], []

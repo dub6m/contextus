@@ -172,12 +172,12 @@ class TraversalEngine:
     # Public entry point
     # ------------------------------------------------------------------
 
-    def query(self, query: str, graph_name: str = "") -> TraversalResult:
+    def query(self, query: str, graph_name: str = "", previous_context: str = "") -> TraversalResult:
         result = TraversalResult(query=query, graph_name=graph_name)
         session = SessionRecord()
 
         # Step 1 — find anchor node
-        anchor = self._find_anchor(query)
+        anchor = self._find_anchor(query, previous_context=previous_context)
         if anchor is None:
             result.reasoning = "Could not identify a relevant anchor node."
             return result
@@ -190,7 +190,8 @@ class TraversalEngine:
         done = False
 
         expansions, done = self._bfs_phase(
-            query, result, session, collected_ids, queued_ids, queue, expansions, done
+            query, result, session, collected_ids, queued_ids, queue, expansions, done,
+            previous_context=previous_context,
         )
 
         # Step 3 — Verifier reviews collected subgraph
@@ -228,7 +229,8 @@ class TraversalEngine:
 
             # Continue BFS from where we left off
             expansions, done = self._bfs_phase(
-                query, result, session, collected_ids, queued_ids, queue, expansions, done
+                query, result, session, collected_ids, queued_ids, queue, expansions, done,
+                previous_context=previous_context,
             )
 
             # Re-verify
@@ -254,14 +256,15 @@ class TraversalEngine:
 
     def _bfs_phase(
         self,
-        query:         str,
-        result:        TraversalResult,
-        session:       SessionRecord,
-        collected_ids: set[str],
-        queued_ids:    set[str],
-        queue:         list[str],
-        expansions:    int,
-        done:          bool,
+        query:            str,
+        result:           TraversalResult,
+        session:          SessionRecord,
+        collected_ids:    set[str],
+        queued_ids:       set[str],
+        queue:            list[str],
+        expansions:       int,
+        done:             bool,
+        previous_context: str = "",
     ) -> tuple[int, bool]:
         """Run one BFS phase, updating result and session in place.
         Returns updated (expansions, done)."""
@@ -306,7 +309,8 @@ class TraversalEngine:
                 continue
 
             visit_ids, done, reason = self._collector_step(
-                query, result.nodes, unvisited
+                query, result.nodes, unvisited,
+                previous_context=previous_context,
             )
             result.reasoning = reason
 
@@ -343,7 +347,7 @@ class TraversalEngine:
     # Collector: anchor selection
     # ------------------------------------------------------------------
 
-    def _find_anchor(self, query: str) -> Node | None:
+    def _find_anchor(self, query: str, previous_context: str = "") -> Node | None:
         all_nodes = self.graph.all_nodes()
         if not all_nodes:
             return None
@@ -354,6 +358,8 @@ class TraversalEngine:
             for n in all_nodes
         )
         user_prompt = f'Query: "{query}"\n\nNodes:\n[\n{node_list}\n]'
+        if previous_context:
+            user_prompt += f"\n\n{previous_context}"
 
         raw = self.llm.complete(system=COLLECTOR_ANCHOR_SYSTEM, user=user_prompt)
         parsed = _parse_json(raw.content)
@@ -374,6 +380,7 @@ class TraversalEngine:
         query:      str,
         collected:  list[Node],
         candidates: list[tuple[Node, Edge]],
+        previous_context: str = "",
     ) -> tuple[list[str], bool, str]:
         """Returns (node_ids_to_visit, done_flag, reason_string)."""
 
@@ -391,6 +398,8 @@ class TraversalEngine:
             f'Already collected:\n{collected_summary}\n\n'
             f'Candidate neighbors:\n[\n{candidate_list}\n]'
         )
+        if previous_context:
+            user_prompt += f"\n\n{previous_context}"
 
         raw = self.llm.complete(system=COLLECTOR_STEP_SYSTEM, user=user_prompt)
         parsed = _parse_json(raw.content)
@@ -470,3 +479,124 @@ def _parse_json(text: str) -> dict | None:
             except json.JSONDecodeError:
                 return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# Multi-pass result
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MultiPassResult:
+    """
+    Result from a multi-pass traversal attempt.
+    Wraps the best TraversalResult across all passes.
+    """
+    query:        str
+    graph_name:   str                   = ""
+    best:         TraversalResult       = None   # the result being returned
+    all_passes:   list[TraversalResult]  = field(default_factory=list)
+    passes_run:   int                   = 0
+    verified:     bool                  = False
+
+    def nodes(self) -> list:
+        return self.best.nodes if self.best else []
+
+    def edges(self) -> list:
+        return self.best.edges if self.best else []
+
+    def missing_description(self) -> str:
+        return self.best.missing_description if self.best else ""
+
+    def summary(self) -> str:
+        lines = [
+            f"Query      : {self.query}",
+            f"Passes run : {self.passes_run}",
+            f"Verified   : {self.verified}",
+            f"Nodes      : {len(self.nodes())}",
+        ]
+        if not self.verified and self.missing_description():
+            lines.append(f"Missing    : {self.missing_description()}")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Multi-pass engine
+# ---------------------------------------------------------------------------
+
+class MultiPassEngine:
+    """
+    Runs up to max_passes full traversal passes on a query.
+    Each pass after the first receives context from the previous attempt.
+    Backtracking within each pass is handled by TraversalEngine.
+
+    Exit conditions (in priority order):
+    1. A pass returns verified — return immediately
+    2. max_passes reached — return best unverified result
+    3. No nodes collected on a pass — return best result so far
+
+    Parameters
+    ----------
+    graph      : the Graph to traverse
+    llm        : any LLMClient implementation
+    max_passes : maximum number of full traversal passes (default 3)
+    max_depth  : passed through to TraversalEngine
+    alpha      : passed through to TraversalEngine
+    """
+
+    def __init__(
+        self,
+        graph:      Graph,
+        llm:        LLMClient,
+        max_passes: int   = 3,
+        max_depth:  int   = 10,
+        alpha:      float = 0.5,
+    ):
+        self.graph      = graph
+        self.llm        = llm
+        self.max_passes = max_passes
+        self.max_depth  = max_depth
+        self.alpha      = alpha
+
+    def query(self, query: str, graph_name: str = "") -> MultiPassResult:
+        mp_result = MultiPassResult(query=query, graph_name=graph_name)
+        previous_context = ""
+
+        for pass_num in range(1, self.max_passes + 1):
+            engine = TraversalEngine(
+                graph=self.graph,
+                llm=self.llm,
+                max_depth=self.max_depth,
+                alpha=self.alpha,
+            )
+            pass_result = engine.query(
+                query, graph_name=graph_name,
+                previous_context=previous_context,
+            )
+            mp_result.all_passes.append(pass_result)
+            mp_result.passes_run = pass_num
+
+            # Early exit: zero nodes collected
+            if not pass_result.nodes:
+                break
+
+            # Track best result (most nodes; on tie prefer latest pass)
+            if mp_result.best is None or len(pass_result.nodes) >= len(mp_result.best.nodes):
+                mp_result.best = pass_result
+
+            # Exit on verification
+            if pass_result.verified:
+                mp_result.verified = True
+                return mp_result
+
+            # Build context for next pass
+            collected_labels = ", ".join(n.label for n in pass_result.nodes)
+            previous_context = (
+                f"Previous attempt summary:\n"
+                f"- Collected nodes: {collected_labels}\n"
+                f"- Verifier finding: {pass_result.verifier_note}\n"
+                f"- What was missing: {pass_result.missing_description}\n\n"
+                f"Do not repeat the same traversal path. "
+                f"Use this context to approach the query differently and fill the identified gaps."
+            )
+
+        return mp_result

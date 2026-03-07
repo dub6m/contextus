@@ -4,7 +4,7 @@ Tests for the WeightSystem.
 
 import traceback
 from contextus import Node, NodeType, Edge, Graph, WeightSystem
-from contextus.traversal import TraversalResult
+from contextus.traversal import TraversalResult, MultiPassResult
 from contextus.router import RouterResult
 
 
@@ -229,7 +229,10 @@ def test_observe_router_updates_all_traversals():
     t1 = make_traversal("TestGraph",  [e1], verified=True)
     t2 = make_traversal("OtherGraph", [e3], verified=False, noise_ids=[n_a.id, n_b.id])
 
-    rr = RouterResult(query="test", traversals=[t1, t2])
+    mp1 = MultiPassResult(query="test", graph_name="TestGraph", best=t1, passes_run=1, verified=True, all_passes=[t1])
+    mp2 = MultiPassResult(query="test", graph_name="OtherGraph", best=t2, passes_run=1, verified=False, all_passes=[t2])
+
+    rr = RouterResult(query="test", traversals=[mp1, mp2])
     ws.observe_router(rr)
 
     assert g1.get_edge(e1.id).derived_weight == 1.0
@@ -393,6 +396,67 @@ def test_traversal_record_stores_verifier_details():
 
 
 # ---------------------------------------------------------------------------
+# observe_multi tests
+# ---------------------------------------------------------------------------
+
+def test_observe_multi_updates_weights_from_best_only():
+    """
+    Only the best pass's edges should have weights updated.
+    Intermediate pass edges should not.
+    """
+    g, n1, n2, n3, e1, e2 = make_graph()
+    ws = WeightSystem()
+    ws.register(g)
+
+    # Pass 1 (intermediate): uses e1, unverified
+    pass1 = make_traversal("TestGraph", [e1], verified=False, missing_description="Missing C")
+    # Pass 2 (best): uses e2, verified
+    pass2 = make_traversal("TestGraph", [e2], verified=True)
+
+    mpr = MultiPassResult(
+        query="test",
+        graph_name="TestGraph",
+        best=pass2,
+        all_passes=[pass1, pass2],
+        passes_run=2,
+        verified=True,
+    )
+    ws.observe_multi(mpr)
+
+    # e2 from best pass should be updated (signal 1.0)
+    assert g.get_edge(e2.id).derived_weight == 1.0
+    # e1 from intermediate pass should NOT be updated
+    assert g.get_edge(e1.id).derived_weight is None
+
+
+def test_observe_multi_logs_all_passes_to_history():
+    """
+    All passes should appear in history regardless of which is best.
+    """
+    g, n1, n2, n3, e1, e2 = make_graph()
+    ws = WeightSystem()
+    ws.register(g)
+
+    pass1 = make_traversal("TestGraph", [e1], verified=False, missing_description="Missing C")
+    pass2 = make_traversal("TestGraph", [e2], verified=True)
+
+    mpr = MultiPassResult(
+        query="test",
+        graph_name="TestGraph",
+        best=pass2,
+        all_passes=[pass1, pass2],
+        passes_run=2,
+        verified=True,
+    )
+    ws.observe_multi(mpr)
+
+    h = ws.history()
+    assert len(h) == 2  # both passes logged
+    assert h[0].verified is False
+    assert h[1].verified is True
+
+
+# ---------------------------------------------------------------------------
 # Run all
 # ---------------------------------------------------------------------------
 
@@ -425,6 +489,9 @@ if __name__ == "__main__":
         test_noise_only_penalises_noise_edges,
         test_mixed_missing_and_noise_applies_case3,
         test_traversal_record_stores_verifier_details,
+        # observe_multi tests
+        test_observe_multi_updates_weights_from_best_only,
+        test_observe_multi_logs_all_passes_to_history,
     ]
 
     passed, failed = [], []

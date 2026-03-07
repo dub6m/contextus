@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .graph import Graph
-    from .traversal import TraversalResult
+    from .traversal import TraversalResult, MultiPassResult
     from .router import RouterResult
 
 
@@ -155,12 +155,64 @@ class WeightSystem:
             noise_ids=list(result.noise_ids),
         ))
 
+    def observe_multi(self, result: "MultiPassResult") -> None:
+        """
+        Observes all passes within a MultiPassResult.
+        Only the best result's edges are used for weight updates.
+        Intermediate passes are logged to history but do not update weights.
+        """
+        # Log all passes to history
+        for pass_result in result.all_passes:
+            self._history.append(TraversalRecord(
+                query=pass_result.query,
+                graph_name=pass_result.graph_name,
+                edge_ids=[e.id for e in pass_result.edges],
+                verified=pass_result.verified,
+                missing_description=pass_result.missing_description,
+                noise_ids=list(pass_result.noise_ids),
+            ))
+
+        # Only update weights from the best pass
+        if result.best is not None:
+            # Call observe but we already logged history above,
+            # so we do weight updates manually here
+            graph = self._graphs.get(result.best.graph_name)
+            if graph is None:
+                return
+
+            best = result.best
+            if best.verified:
+                for edge in best.edges:
+                    try:
+                        live_edge = graph.get_edge(edge.id)
+                        self._update_edge(live_edge, 1.0)
+                    except KeyError:
+                        continue
+            elif best.noise_ids:
+                noise_set = set(best.noise_ids)
+                for edge in best.edges:
+                    try:
+                        live_edge = graph.get_edge(edge.id)
+                    except KeyError:
+                        continue
+                    if edge.source_id in noise_set and edge.target_id in noise_set:
+                        self._update_edge(live_edge, 0.0)
+            elif best.missing_description:
+                pass  # Case 2: skip
+            else:
+                for edge in best.edges:
+                    try:
+                        live_edge = graph.get_edge(edge.id)
+                        self._update_edge(live_edge, 0.0)
+                    except KeyError:
+                        continue
+
     def observe_router(self, result: "RouterResult") -> None:
         """
         Convenience method — observes all traversals within a RouterResult.
         """
         for traversal in result.traversals:
-            self.observe(traversal)
+            self.observe_multi(traversal)
 
     # ------------------------------------------------------------------
     # Weight update

@@ -7,7 +7,7 @@ can be tested without a live API key.
 import json
 from contextus import Node, NodeType, Edge, Graph
 from contextus.llm import LLMClient, LLMResponse
-from contextus.traversal import TraversalEngine, TraversalResult, SessionRecord, _parse_json
+from contextus.traversal import TraversalEngine, TraversalResult, SessionRecord, MultiPassEngine, MultiPassResult, _parse_json
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +606,182 @@ def test_returns_most_complete_result_when_all_unverified():
 
 
 # ---------------------------------------------------------------------------
+# MultiPassResult tests
+# ---------------------------------------------------------------------------
+
+def test_multi_pass_result_nodes_delegates_to_best():
+    n = Node(label="X", type=NodeType.DEFINITION, body="body", scope="scope")
+    tr = TraversalResult(query="q", nodes=[n], verified=True)
+    mpr = MultiPassResult(query="q", best=tr, passes_run=1, verified=True)
+    assert mpr.nodes() == [n]
+
+def test_multi_pass_result_verified_false_when_no_passes():
+    mpr = MultiPassResult(query="q")
+    assert mpr.verified is False
+    assert mpr.nodes() == []
+    assert mpr.edges() == []
+
+def test_multi_pass_result_summary_includes_missing_when_unverified():
+    tr = TraversalResult(query="q", missing_description="Need more nodes", verified=False)
+    mpr = MultiPassResult(query="q", best=tr, passes_run=1, verified=False)
+    s = mpr.summary()
+    assert "Missing" in s
+    assert "Need more nodes" in s
+
+
+# ---------------------------------------------------------------------------
+# MultiPassEngine tests
+# ---------------------------------------------------------------------------
+
+def test_multi_pass_returns_immediately_on_first_pass_verified():
+    g, a, b, c, d = build_backtrack_graph()
+    mock = MockLLMClient([
+        # Pass 1: anchor -> A, collector visits B, verifier verified
+        # B has no unvisited neighbours (only A is a neighbour and it's collected),
+        # so no collector step is called for B.
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        json.dumps({"visit": [b.id], "done": False, "reason": "get B"}),
+        json.dumps({"complete": True, "noise_ids": [], "missing_description": "", "note": "ok"}),
+    ])
+    engine = MultiPassEngine(graph=g, llm=mock, max_passes=3, max_depth=10)
+    result = engine.query("Explain A")
+    assert result.passes_run == 1
+    assert result.verified is True
+    assert len(result.all_passes) == 1
+
+def test_multi_pass_runs_second_pass_when_first_unverified():
+    g, a, b, c, d = build_backtrack_graph()
+    mock = MockLLMClient([
+        # Pass 1: anchor -> A, visits C only, verifier unverified + missing
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        json.dumps({"visit": [c.id], "done": False, "reason": "try C"}),
+        # Verifier 1 (first pass) - unverified
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Missing D.", "note": "incomplete"}),
+        # Backtracking picks up B + D, second verifier still unverified
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Still missing.", "note": "still incomplete"}),
+        # Pass 2: anchor -> A, visits D, verifier verified
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        json.dumps({"visit": [d.id], "done": False, "reason": "get D this time"}),
+        json.dumps({"complete": True, "noise_ids": [], "missing_description": "", "note": "all good"}),
+    ])
+    engine = MultiPassEngine(graph=g, llm=mock, max_passes=3, max_depth=10)
+    result = engine.query("Explain A")
+    assert result.passes_run == 2
+    assert result.verified is True
+
+def test_multi_pass_runs_maximum_three_passes():
+    g, a, b, c, d = build_backtrack_graph()
+    # Each pass: anchor + collector done + verifier unverified (no unchosen neighbours for backtracking)
+    responses = []
+    for _ in range(3):
+        responses.extend([
+            json.dumps({"anchor_id": a.id, "reason": "root"}),
+            json.dumps({"visit": [], "done": True, "reason": "done"}),
+            json.dumps({"complete": False, "noise_ids": [], "missing_description": "Missing stuff.", "note": "incomplete"}),
+            # Backtracking: unchosen neighbours exist, verifier still says incomplete
+            json.dumps({"complete": False, "noise_ids": [], "missing_description": "Still missing.", "note": "still incomplete"}),
+        ])
+    mock = MockLLMClient(responses)
+    engine = MultiPassEngine(graph=g, llm=mock, max_passes=3, max_depth=10)
+    result = engine.query("Explain A")
+    assert result.passes_run == 3
+    assert result.verified is False
+
+def test_multi_pass_returns_best_unverified_after_max_passes():
+    g, a, b, c, d = build_backtrack_graph()
+    mock = MockLLMClient([
+        # Pass 1: anchor A, visits C only -> 2 nodes (A, C)
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        json.dumps({"visit": [c.id], "done": False, "reason": "try C"}),
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Missing.", "note": "incomplete"}),
+        # Backtracking picks up B+D -> all 4 nodes, still unverified
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Still missing.", "note": "still incomplete"}),
+        # Pass 2: anchor A, visits B only -> 2 nodes (A, B)
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        json.dumps({"visit": [b.id], "done": True, "reason": "try B"}),
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Missing.", "note": "incomplete"}),
+    ])
+    engine = MultiPassEngine(graph=g, llm=mock, max_passes=2, max_depth=10)
+    result = engine.query("Explain A")
+    assert result.verified is False
+    # Best should be pass 1 (4 nodes after backtracking) not pass 2 (2 nodes)
+    assert len(result.nodes()) >= 4
+
+def test_multi_pass_early_exit_on_zero_nodes():
+    g, a, b, c, d = build_backtrack_graph()
+    mock = MockLLMClient([
+        # Pass 1: anchor A, collector done, verifier unverified
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        json.dumps({"visit": [], "done": True, "reason": "done"}),
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Missing D.", "note": "incomplete"}),
+        # Backtracking picks up B+C+D, verifier still unverified
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Still missing.", "note": "still incomplete"}),
+        # Pass 2: anchor fails -> zero nodes
+        "not json at all",
+    ])
+    engine = MultiPassEngine(graph=g, llm=mock, max_passes=3, max_depth=10)
+    result = engine.query("Explain A")
+    assert result.passes_run == 2
+    # Best should be from pass 1
+    assert len(result.nodes()) > 0
+
+def test_multi_pass_previous_context_appended_to_prompts():
+    """On pass 2, the user prompt should contain 'Previous attempt summary'."""
+    g, a, b, c, d = build_backtrack_graph()
+
+    class CapturingMockLLMClient(MockLLMClient):
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.user_prompts = []
+
+        def complete(self, system, user, temperature=0.0):
+            self.user_prompts.append(user)
+            return super().complete(system, user, temperature)
+
+    mock = CapturingMockLLMClient([
+        # Pass 1: anchor + done + unverified
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        json.dumps({"visit": [], "done": True, "reason": "done"}),
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Missing D.", "note": "incomplete"}),
+        # Backtracking: unchosen neighbours visited, still unverified
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Still missing.", "note": "still incomplete"}),
+        # Pass 2: anchor + done + verified
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        json.dumps({"visit": [], "done": True, "reason": "done"}),
+        json.dumps({"complete": True, "noise_ids": [], "missing_description": "", "note": "ok"}),
+    ])
+    engine = MultiPassEngine(graph=g, llm=mock, max_passes=3, max_depth=10)
+    engine.query("Explain A")
+
+    # The anchor prompt for pass 2 should contain previous context
+    # Pass 1 uses prompts [0,1,2] (anchor, collector, verifier) + [3] (backtrack verifier)
+    # Pass 2 anchor is the next prompt after pass 1 finishes
+    pass2_prompts = [p for p in mock.user_prompts if "Previous attempt summary" in p]
+    assert len(pass2_prompts) > 0, "Pass 2 should receive previous attempt context"
+
+def test_multi_pass_each_pass_has_independent_session_record():
+    """Backtrack state from pass 1 should not carry into pass 2."""
+    g, a, b, c, d = build_backtrack_graph()
+    mock = MockLLMClient([
+        # Pass 1: anchor A, visits C (leaves B+D unchosen), verifier unverified
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        json.dumps({"visit": [c.id], "done": False, "reason": "try C"}),
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Missing D.", "note": "incomplete"}),
+        # Backtracking: B+D enqueued, still unverified
+        json.dumps({"complete": False, "noise_ids": [], "missing_description": "Still missing.", "note": "still incomplete"}),
+        # Pass 2: fresh start, anchor A, visits D, verified
+        json.dumps({"anchor_id": a.id, "reason": "root"}),
+        json.dumps({"visit": [d.id], "done": False, "reason": "get D"}),
+        json.dumps({"complete": True, "noise_ids": [], "missing_description": "", "note": "ok"}),
+    ])
+    engine = MultiPassEngine(graph=g, llm=mock, max_passes=3, max_depth=10)
+    result = engine.query("Explain A")
+    # Pass 2 should work independently
+    assert result.passes_run == 2
+    assert result.verified is True
+
+
+# ---------------------------------------------------------------------------
 # Run all
 # ---------------------------------------------------------------------------
 
@@ -633,6 +809,16 @@ if __name__ == "__main__":
         test_stub_node_not_expanded,
         test_returns_verified_result_when_backtracking_succeeds,
         test_returns_most_complete_result_when_all_unverified,
+        test_multi_pass_result_nodes_delegates_to_best,
+        test_multi_pass_result_verified_false_when_no_passes,
+        test_multi_pass_result_summary_includes_missing_when_unverified,
+        test_multi_pass_returns_immediately_on_first_pass_verified,
+        test_multi_pass_runs_second_pass_when_first_unverified,
+        test_multi_pass_runs_maximum_three_passes,
+        test_multi_pass_returns_best_unverified_after_max_passes,
+        test_multi_pass_early_exit_on_zero_nodes,
+        test_multi_pass_previous_context_appended_to_prompts,
+        test_multi_pass_each_pass_has_independent_session_record,
     ]
 
     passed, failed = [], []
@@ -647,4 +833,3 @@ if __name__ == "__main__":
     print(f"\n{len(passed)}/{len(tests)} passed")
     for name, tb in failed:
         print(f"\nFAIL: {name}\n{tb}")
-
