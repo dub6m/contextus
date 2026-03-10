@@ -27,3 +27,8 @@ Thumbs.db
 
 # Runtime artefacts
 graphs/
+extractions/
+models/
+# Local reference and test documents
+contextus/input/
+scrap/converse.txt

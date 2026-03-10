@@ -13,8 +13,12 @@ dependencies = [
     "sentence-transformers>=2.2.0",
     "hdbscan>=0.8.33",
     "numpy>=1.24.0",
+    "pymupdf",
+    "pdfplumber",
+    "huggingface_hub",
+    "doclayout-yolo",
+    "pywin32; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
-
