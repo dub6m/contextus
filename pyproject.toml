@@ -13,10 +13,12 @@ dependencies = [
     "sentence-transformers>=2.2.0",
     "hdbscan>=0.8.33",
     "numpy>=1.24.0",
+    "scikit-learn>=1.4.0",
     "pymupdf",
     "pdfplumber",
     "huggingface_hub",
     "doclayout-yolo",
+    "docling",
     "pywin32; sys_platform == 'win32'",
 ]
 

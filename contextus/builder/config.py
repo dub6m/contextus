@@ -36,3 +36,7 @@ class BuilderConfig:
 
     SEMANTIC_EDGE_THRESHOLD: float = 0.75
     MAX_SEMANTIC_EDGES_PER_NODE: int = 5
+
+    CHUNK_ACTION_MODEL_PATH: str = "models/chunk-action-logreg.pkl"
+    DOCLING_ENABLE_STRUCTURAL_ENRICHMENT: bool = False
+    DOCLING_ARTIFACTS_PATH: str = "models/docling-artifacts"

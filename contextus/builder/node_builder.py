@@ -8,6 +8,7 @@ from contextus import Node, NodeType
 from contextus.ingestion.models import ExtractedElement
 from contextus.llm import LLMClient
 
+from .consolidation import ConsolidatedChunk
 from .preprocessor import ElementPreprocessor
 
 
@@ -22,15 +23,16 @@ class NodeBuilder:
         self.preprocessor = preprocessor or ElementPreprocessor()
         self.llm_calls = 0
 
-    def build_nodes(self, chunks: list[list[ExtractedElement]]) -> list[Node]:
+    def build_nodes(self, chunks: list[list[ExtractedElement] | ConsolidatedChunk]) -> list[Node]:
         """Build one node per chunk, falling back to stub nodes on repeated parse failure."""
         nodes: list[Node] = []
         for index, chunk in enumerate(chunks):
+            elements = self._node_elements(chunk)
             chunk_text = self._chunk_text(chunk)
             metadata = self._chunk_metadata(chunk)
             payload = self._request_node_payload(chunk_text)
             if payload is None:
-                nodes.append(self._fallback_node(chunk, index, metadata))
+                nodes.append(self._fallback_node(elements, index, metadata))
                 continue
             try:
                 node = Node(
@@ -42,7 +44,7 @@ class NodeBuilder:
                     metadata=metadata,
                 )
             except Exception:
-                node = self._fallback_node(chunk, index, metadata)
+                node = self._fallback_node(elements, index, metadata)
             nodes.append(node)
         return nodes
 
@@ -97,10 +99,42 @@ class NodeBuilder:
             metadata=metadata,
         )
 
-    def _chunk_text(self, chunk: list[ExtractedElement]) -> str:
-        return "\n".join(self.preprocessor.to_text(element) for element in chunk)
+    def _node_elements(self, chunk: list[ExtractedElement] | ConsolidatedChunk) -> list[ExtractedElement]:
+        if isinstance(chunk, ConsolidatedChunk):
+            return chunk.node_elements()
+        return list(chunk)
 
-    def _chunk_metadata(self, chunk: list[ExtractedElement]) -> dict[str, Any]:
+    def _chunk_text(self, chunk: list[ExtractedElement] | ConsolidatedChunk) -> str:
+        return "\n".join(self.preprocessor.to_text(element) for element in self._node_elements(chunk))
+
+    def _chunk_metadata(self, chunk: list[ExtractedElement] | ConsolidatedChunk) -> dict[str, Any]:
+        if isinstance(chunk, ConsolidatedChunk):
+            node_elements = chunk.node_elements()
+            supporting_evidence = [
+                {
+                    "chunk_index": segment.chunk_index,
+                    "action": segment.action,
+                    "source": segment.source,
+                    "confidence": segment.confidence,
+                    "needs_review": segment.needs_review,
+                    "used_for_node_text": segment.used_for_node_text,
+                    "page_numbers": segment.page_numbers(),
+                    "element_ids": segment.element_ids(),
+                    "text": segment.text,
+                    "rationale": segment.rationale,
+                }
+                for segment in chunk.ordered_segments()
+                if segment.source != "primary"
+            ]
+            return {
+                "source_page_numbers": sorted({element.page_number for element in node_elements}),
+                "source_element_ids": [element.id for element in node_elements],
+                "chunk_size": len(node_elements),
+                "canonical_chunk_index": chunk.canonical_chunk_index,
+                "merged_chunk_indices": [segment.chunk_index for segment in chunk.node_text_segments()],
+                "supporting_evidence_count": len(supporting_evidence),
+                "supporting_evidence": supporting_evidence,
+            }
         return {
             "source_page_numbers": sorted({element.page_number for element in chunk}),
             "source_element_ids": [element.id for element in chunk],
