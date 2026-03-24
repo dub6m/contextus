@@ -1,5 +1,6 @@
 pytest>=8.0
 cerebras_cloud_sdk
+openai
 python-dotenv
 sentence-transformers>=2.2.0
 hdbscan>=0.8.33

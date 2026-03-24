@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import shutil
 import tempfile
 
 from .analyzers import PdfLayoutAnalyzer
 from .converters import PptxToPdfConverter
 from .extractors import PdfContentExtractor
+from ..llm import LLMClient, OpenAIResponsesClient
 from .models import ExtractedDocument
 from .storage import ExtractionArtifactStore
 
@@ -17,11 +19,14 @@ class DocumentExtractionRouter:
         *,
         pdf_analyzer: PdfLayoutAnalyzer | None = None,
         pdf_extractor: PdfContentExtractor | None = None,
+        vision_llm_client: LLMClient | None = None,
+        formula_llm_client: LLMClient | None = None,
         pptx_converter: PptxToPdfConverter | None = None,
         artifact_store: ExtractionArtifactStore | None = None,
     ) -> None:
         self.pdf_analyzer = pdf_analyzer or PdfLayoutAnalyzer()
-        self.pdf_extractor = pdf_extractor or PdfContentExtractor()
+        self.vision_llm_client = vision_llm_client or formula_llm_client or self._default_vision_llm_client()
+        self.pdf_extractor = pdf_extractor or PdfContentExtractor(vision_llm_client=self.vision_llm_client)
         self.pptx_converter = pptx_converter or PptxToPdfConverter()
         self.artifact_store = artifact_store
 
@@ -77,3 +82,12 @@ class DocumentExtractionRouter:
         finally:
             if conversion_dir is not None:
                 shutil.rmtree(conversion_dir, ignore_errors=True)
+
+    def _default_vision_llm_client(self) -> LLMClient | None:
+        if not os.environ.get("OPENAI_API_KEY"):
+            return None
+        model = os.environ.get("CONTEXTUS_VISION_MODEL") or os.environ.get("CONTEXTUS_FORMULA_MODEL") or "gpt-5-nano"
+        try:
+            return OpenAIResponsesClient(model=model)
+        except Exception:
+            return None

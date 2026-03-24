@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 import argparse
 
+from dotenv import load_dotenv
+
 from contextus.ingestion import DocumentExtractionRouter
 
 
 def main() -> None:
+    load_dotenv(override=True)
     parser = argparse.ArgumentParser(description="Extract typed document elements into a Contextus artifact.")
     parser.add_argument("--file", "-f", required=True, help="Path to a .pdf or .pptx document")
     parser.add_argument(

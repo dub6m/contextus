@@ -26,7 +26,18 @@ def test_to_text_returns_text_content_for_text_elements():
 
 def test_to_text_converts_formula_to_readable_text():
     preprocessor = ElementPreprocessor()
-    element = make_element('formula', id='formula-a', content={'latex': r'\frac{a}{b} + x^2_1 + \sum'})
+    element = make_element(
+        'formula',
+        id='formula-a',
+        content={
+            'format': 'formula',
+            'figure_type': 'formula',
+            'raw_text': '',
+            'structured_content': {'latex': r'\frac{a}{b} + x^2_1 + \sum', 'mathml': None},
+            'literal_description': None,
+            'source_confidence': 0.95,
+        },
+    )
     text = preprocessor.to_text(element)
     assert text.startswith('Formula: ')
     assert 'a divided by b' in text
@@ -41,8 +52,16 @@ def test_to_text_summarizes_table():
         'table',
         id='table-a',
         content={
-            'headers': ['Name', 'Value'],
-            'rows': [['Name', 'Value'], ['Alpha', '10'], ['Beta', '20']],
+            'format': 'table',
+            'figure_type': 'table',
+            'raw_text': 'Name Value Alpha 10 Beta 20',
+            'structured_content': {
+                'headers': ['Name', 'Value'],
+                'rows': [['Alpha', '10'], ['Beta', '20']],
+                'markdown': '| Name | Value |\n| --- | --- |\n| Alpha | 10 |\n| Beta | 20 |',
+            },
+            'literal_description': None,
+            'source_confidence': 0.92,
         },
     )
     text = preprocessor.to_text(element)
@@ -50,16 +69,66 @@ def test_to_text_summarizes_table():
     assert 'Name=Alpha' in text
 
 
-def test_to_text_uses_figure_ocr_text():
+def test_to_text_uses_figure_description_and_raw_text():
     preprocessor = ElementPreprocessor()
-    element = make_element('figure', id='figure-a', content={'figure_type': 'diagram', 'ocr_text': 'nearest pair'})
-    assert preprocessor.to_text(element) == 'Figure (diagram): nearest pair'
+    element = make_element(
+        'figure',
+        id='figure-a',
+        content={
+            'format': 'figure',
+            'figure_type': 'diagram',
+            'raw_text': 'Nearest pair split band',
+            'structured_content': {'nodes': [{'id': 'n1', 'label': 'Split'}, {'id': 'n2', 'label': 'Merge'}], 'edges': []},
+            'literal_description': 'A divide-and-conquer diagram.',
+            'source_confidence': 0.88,
+        },
+    )
+    text = preprocessor.to_text(element)
+    assert text.startswith('Figure (diagram):')
+    assert 'Split' in text
+    assert 'divide-and-conquer diagram' in text.lower()
 
 
 def test_to_text_figure_falls_back_to_no_text_content():
     preprocessor = ElementPreprocessor()
-    element = make_element('image', id='image-a', content={'figure_type': 'image'})
+    element = make_element(
+        'image',
+        id='image-a',
+        content={
+            'format': 'figure',
+            'figure_type': 'image',
+            'raw_text': '',
+            'structured_content': None,
+            'literal_description': None,
+            'source_confidence': 0.4,
+        },
+    )
     assert preprocessor.to_text(element) == 'Figure (image): no text content'
+
+
+def test_to_text_summarizes_chart_structured_content():
+    preprocessor = ElementPreprocessor()
+    element = make_element(
+        'chart',
+        id='chart-a',
+        content={
+            'format': 'figure',
+            'figure_type': 'chart',
+            'raw_text': 'Q1 Q2 Revenue',
+            'structured_content': {
+                'chart_type': 'bar',
+                'axes': {'x_label': 'Quarter', 'y_label': 'Revenue'},
+                'series': [{'name': 'Revenue', 'values': [{'x': 'Q1', 'y': '10'}]}],
+                'findings': ['Revenue rises from Q1 to Q2'],
+            },
+            'literal_description': None,
+            'source_confidence': 0.91,
+        },
+    )
+    text = preprocessor.to_text(element)
+    assert 'type=bar' in text
+    assert 'axes x=Quarter, y=Revenue' in text
+    assert 'Revenue rises from Q1 to Q2' in text
 
 
 def test_to_text_returns_fallback_on_empty_content():

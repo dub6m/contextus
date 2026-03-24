@@ -1,6 +1,7 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import base64
 import os
 
 
@@ -20,6 +21,17 @@ class LLMClient(ABC):
     def complete(self, system: str, user: str, temperature: float = 0.0) -> LLMResponse:
         """Single-turn completion. Temperature 0 by default so behavior stays deterministic."""
         ...
+
+    def complete_with_image(
+        self,
+        system: str,
+        user: str,
+        image_bytes: bytes,
+        *,
+        mime_type: str = "image/png",
+        temperature: float = 0.0,
+    ) -> LLMResponse:
+        raise NotImplementedError(f"{type(self).__name__} does not support image input.")
 
 
 class CerebrasClient(LLMClient):
@@ -103,3 +115,109 @@ class CerebrasClient(LLMClient):
             "404",
         )
         return any(marker in message for marker in fallback_markers)
+
+
+class OpenAIResponsesClient(LLMClient):
+    """OpenAI Responses API client with optional image input support."""
+
+    MODEL = "gpt-5-nano"
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        model: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ImportError(
+                "openai is required for OpenAIResponsesClient. "
+                "Run: pip install openai"
+            ) from exc
+
+        self._api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not self._api_key:
+            raise ValueError("OPENAI_API_KEY is required for OpenAIResponsesClient.")
+        self._model = model or os.environ.get("OPENAI_MODEL") or self.MODEL
+        self._base_url = (base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+        self._client = OpenAI(api_key=self._api_key, base_url=self._base_url)
+
+    def complete(self, system: str, user: str, temperature: float = 0.0) -> LLMResponse:
+        response = self._client.responses.create(
+            model=self._model,
+            instructions=system,
+            input=user,
+        )
+        return LLMResponse(content=self._extract_text(response), raw=response)
+
+    def complete_with_image(
+        self,
+        system: str,
+        user: str,
+        image_bytes: bytes,
+        *,
+        mime_type: str = "image/png",
+        temperature: float = 0.0,
+    ) -> LLMResponse:
+        image_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        response = self._client.responses.create(
+            model=self._model,
+            instructions=system,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": user},
+                        {"type": "input_image", "image_url": image_url},
+                    ],
+                }
+            ],
+        )
+        return LLMResponse(content=self._extract_text(response), raw=response)
+
+    def _extract_text(self, response: object) -> str:
+        output_text = getattr(response, "output_text", None)
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text
+
+        if isinstance(response, dict):
+            return self._extract_text_from_dict(response)
+
+        dumped = self._response_as_dict(response)
+        if isinstance(dumped, dict):
+            return self._extract_text_from_dict(dumped)
+        return ""
+
+    def _extract_text_from_dict(self, response: dict[str, object]) -> str:
+        output_text = response.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text
+
+        pieces: list[str] = []
+        for item in response.get("output", []):
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for content in item.get("content", []):
+                if not isinstance(content, dict):
+                    continue
+                text = content.get("text")
+                if isinstance(text, str) and text.strip():
+                    pieces.append(text)
+        return "\n".join(piece for piece in pieces if piece).strip()
+
+    def _response_as_dict(self, response: object) -> dict[str, object] | None:
+        if isinstance(response, dict):
+            return response
+        model_dump = getattr(response, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump()
+            if isinstance(dumped, dict):
+                return dumped
+        to_dict = getattr(response, "to_dict", None)
+        if callable(to_dict):
+            dumped = to_dict()
+            if isinstance(dumped, dict):
+                return dumped
+        return None

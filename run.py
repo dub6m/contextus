@@ -19,7 +19,7 @@ import textwrap
 from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 from contextus import (
     Node, NodeType, Edge, Graph,

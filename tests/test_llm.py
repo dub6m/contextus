@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from contextus.llm import CerebrasClient, LLMResponse
+from contextus.llm import CerebrasClient, LLMResponse, OpenAIResponsesClient
 
 
 class FakeCompletions:
@@ -64,3 +64,56 @@ def test_candidate_models_preserve_primary_then_fallbacks():
     client = make_client([make_response("ok")], model="custom-model", fallback_models=("llama3.1-8b", "qwen-3-32b"))
 
     assert client._candidate_models() == ("custom-model", "llama3.1-8b", "qwen-3-32b")
+
+
+def test_openai_responses_client_extracts_output_text():
+    client = object.__new__(OpenAIResponsesClient)
+
+    text = client._extract_text({"output_text": "vision worked"})
+
+    assert text == "vision worked"
+
+
+def test_openai_responses_client_extracts_message_content_text():
+    client = object.__new__(OpenAIResponsesClient)
+
+    text = client._extract_text(
+        {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "json result"}],
+                }
+            ]
+        }
+    )
+
+    assert text == "json result"
+
+
+class FakeOpenAIResponse:
+    def __init__(self, payload):
+        self._payload = payload
+        self.output_text = payload.get("output_text")
+
+    def model_dump(self):
+        return self._payload
+
+
+def test_openai_responses_client_extracts_sdk_like_response_objects():
+    client = object.__new__(OpenAIResponsesClient)
+
+    text = client._extract_text(
+        FakeOpenAIResponse(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "sdk result"}],
+                    }
+                ]
+            }
+        )
+    )
+
+    assert text == "sdk result"

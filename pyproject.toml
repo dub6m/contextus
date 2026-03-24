@@ -9,6 +9,7 @@ description = "A directed, weighted knowledge graph with LLM-powered traversal."
 requires-python = ">=3.10"
 dependencies = [
     "cerebras_cloud_sdk",
+    "openai",
     "python-dotenv",
     "sentence-transformers>=2.2.0",
     "hdbscan>=0.8.33",

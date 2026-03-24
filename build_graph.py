@@ -13,7 +13,7 @@ from contextus.store import GraphStore
 
 def main() -> None:
     """Build a graph from an extraction artifact and save it to graph storage."""
-    load_dotenv()
+    load_dotenv(override=True)
 
     parser = argparse.ArgumentParser(description="Build a Contextus graph from an extraction artifact.")
     parser.add_argument("--extraction", "-e", required=True, help="Path to an extraction JSON artifact")

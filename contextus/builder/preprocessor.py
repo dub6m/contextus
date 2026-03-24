@@ -26,17 +26,13 @@ class ElementPreprocessor:
             else:
                 text = raw_text
         elif element_type == "formula":
-            latex = ""
-            if isinstance(content, dict):
-                latex = str(content.get("latex") or "").strip()
+            latex = self._formula_latex(content)
             readable = self._latex_to_readable(latex or raw_text)
             text = f"Formula: {readable}" if readable else ""
         elif element_type == "table":
             text = self._table_to_text(content)
         elif element_type in {"figure", "image", "chart", "diagram", "flowchart"}:
-            figure_type = self._figure_type(element)
-            ocr_text = self._figure_text(element)
-            text = f"Figure ({figure_type}): {ocr_text or 'no text content'}"
+            text = self._figure_to_text(element)
 
         if not text.strip():
             text = f"Element of type {element.type} on page {element.page_number}"
@@ -78,8 +74,9 @@ class ElementPreprocessor:
         if not isinstance(content, dict):
             return ""
 
-        headers = content.get("headers") or []
-        rows = content.get("rows") or []
+        structured = self._structured_content(content)
+        headers = structured.get("headers") or content.get("headers") or []
+        rows = structured.get("rows") or content.get("rows") or []
         normalized_headers = [str(item).strip() for item in headers if str(item).strip()]
         normalized_rows = [
             [str(cell).strip() for cell in row]
@@ -109,6 +106,13 @@ class ElementPreprocessor:
             return f"Table with columns {header_text}. First rows show: {'; '.join(row_summaries)}."
         return f"Table with columns {header_text}."
 
+    def _formula_latex(self, content: object) -> str:
+        if not isinstance(content, dict):
+            return ""
+        structured = self._structured_content(content)
+        latex = str(structured.get("latex") or content.get("latex") or "").strip()
+        return latex
+
     def _figure_type(self, element: ExtractedElement) -> str:
         if isinstance(element.content, dict):
             value = str(element.content.get("figure_type") or "").strip()
@@ -121,7 +125,79 @@ class ElementPreprocessor:
 
     def _figure_text(self, element: ExtractedElement) -> str:
         if isinstance(element.content, dict):
-            value = str(element.content.get("ocr_text") or "").strip()
+            value = str(element.content.get("raw_text") or element.content.get("ocr_text") or "").strip()
             if value:
                 return value
         return (element.raw_text or "").strip()
+
+    def _figure_to_text(self, element: ExtractedElement) -> str:
+        figure_type = self._figure_type(element)
+        raw_text = self._figure_text(element)
+        literal_description = self._literal_description(element)
+        structured = self._structured_content(element.content)
+
+        if figure_type == "chart":
+            parts = []
+            chart_type = str(structured.get("chart_type") or "").strip()
+            if chart_type:
+                parts.append(f"type={chart_type}")
+            axes = structured.get("axes")
+            if isinstance(axes, dict):
+                axis_parts = []
+                for label_key, axis_name in (("x_label", "x"), ("y_label", "y")):
+                    value = str(axes.get(label_key) or "").strip()
+                    if value:
+                        axis_parts.append(f"{axis_name}={value}")
+                if axis_parts:
+                    parts.append("axes " + ", ".join(axis_parts))
+            series = structured.get("series")
+            if isinstance(series, list) and series:
+                names = [str(item.get("name") or "").strip() for item in series if isinstance(item, dict)]
+                names = [name for name in names if name]
+                if names:
+                    parts.append("series " + ", ".join(names[:4]))
+            findings = structured.get("findings")
+            if isinstance(findings, list) and findings:
+                finding_text = "; ".join(str(item).strip() for item in findings if str(item).strip())
+                if finding_text:
+                    parts.append("findings " + finding_text)
+            if parts:
+                return f"Figure ({figure_type}): " + ". ".join(parts)
+
+        if figure_type in {"diagram", "flowchart"}:
+            parts = []
+            nodes = structured.get("nodes")
+            if isinstance(nodes, list) and nodes:
+                node_labels = [str(item.get("label") or "").strip() for item in nodes if isinstance(item, dict)]
+                node_labels = [label for label in node_labels if label]
+                if node_labels:
+                    parts.append("nodes " + ", ".join(node_labels[:6]))
+            steps = structured.get("steps")
+            if isinstance(steps, list) and steps:
+                step_text = "; ".join(str(item).strip() for item in steps if str(item).strip())
+                if step_text:
+                    parts.append("steps " + step_text)
+            if literal_description:
+                parts.append(literal_description)
+            if raw_text:
+                parts.append(raw_text)
+            if parts:
+                return f"Figure ({figure_type}): " + ". ".join(parts)
+
+        parts = [part for part in [literal_description, raw_text] if part]
+        if parts:
+            return f"Figure ({figure_type}): " + ". ".join(parts)
+        return f"Figure ({figure_type}): no text content"
+
+    def _structured_content(self, content: object) -> dict[str, object]:
+        if not isinstance(content, dict):
+            return {}
+        structured = content.get("structured_content")
+        return structured if isinstance(structured, dict) else {}
+
+    def _literal_description(self, element: ExtractedElement) -> str:
+        if isinstance(element.content, dict):
+            value = str(element.content.get("literal_description") or "").strip()
+            if value:
+                return value
+        return ""

@@ -32,7 +32,7 @@ def main() -> None:
 
     worker_count = max(1, args.workers)
     if args.mode == "llm":
-        load_dotenv()
+        load_dotenv(override=True)
         labeler = LLMChunkAuditLabeler(
             llm_client=CerebrasClient(),
             llm_client_factory=CerebrasClient if worker_count > 1 else None,

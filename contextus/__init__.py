@@ -3,7 +3,7 @@
 from .node import Node, NodeType
 from .edge import Edge
 from .graph import Graph
-from .llm import LLMClient, CerebrasClient
+from .llm import LLMClient, CerebrasClient, OpenAIResponsesClient
 from .traversal import TraversalEngine, TraversalResult, SessionRecord, MultiPassEngine, MultiPassResult
 from .embeddings import QueryEmbedder, QueryClusterer
 from .weights import WeightSystem
@@ -17,6 +17,7 @@ __all__ = [
     "Graph",
     "LLMClient",
     "CerebrasClient",
+    "OpenAIResponsesClient",
     "TraversalEngine",
     "TraversalResult",
     "MultiPassEngine",
