@@ -496,3 +496,53 @@ def test_policy_uses_docling_apparatus_signal_for_support_only():
 
     assert labeled["weak_action"] == "support_only"
     assert "docling" in labeled["weak_rationale"].lower()
+
+
+def test_policy_labels_abstract_as_support_only():
+    labeler = ChunkAuditLabeler()
+
+    labeled = labeler.label_row(
+        make_row(
+            chunk_text="Abstract",
+            left_chunk_text="Author list",
+            right_chunk_text="This paper presents a compact benchmark for boundary quality.",
+            token_count=1,
+            content_token_count=1,
+            sentence_count=1,
+            chunk_size=1,
+            rhetorical_markers=[],
+            rhetorical_penalty=0.0,
+            heading_score=0.7,
+            proposition_score=0.0,
+            heuristic_viability=0.2,
+            suggested_action="attach_right",
+        )
+    )
+
+    assert labeled["weak_action"] == "support_only"
+    assert "front-matter" in labeled["weak_rationale"].lower()
+
+
+def test_policy_labels_chapter_heading_as_support_only():
+    labeler = ChunkAuditLabeler()
+
+    labeled = labeler.label_row(
+        make_row(
+            chunk_text="Chapter 0",
+            left_chunk_text="Preface text",
+            right_chunk_text="Prologue",
+            token_count=2,
+            content_token_count=1,
+            sentence_count=1,
+            chunk_size=1,
+            rhetorical_markers=[],
+            rhetorical_penalty=0.0,
+            heading_score=0.98,
+            proposition_score=0.0,
+            heuristic_viability=0.1,
+            suggested_action="attach_left",
+        )
+    )
+
+    assert labeled["weak_action"] == "support_only"
+    assert "front-matter" in labeled["weak_rationale"].lower()

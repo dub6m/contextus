@@ -40,6 +40,16 @@ PUBLICATION_APPARATUS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+FRONT_MATTER_LABEL_PATTERN = re.compile(
+    r"^(?:abstract|keywords|contents|table of contents|preface|prologue|chapter\s+\d+|land acknowledgement|reconnaissance territoriale|original signed by|original sign.? par)$",
+    re.IGNORECASE,
+)
+
+SECTION_HEADING_PATTERN = re.compile(
+    r"^(?:principle\s+\d+[:.]?.*|\d+(?:\.\d+){1,4}(?:\s+.+)?|chapter\s+\d+|section\s+\d+|part\s+[ivxlcdm]+|[ivxlcdm]+\.\s+.+)$",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class ChunkLabelDecision:
@@ -430,6 +440,18 @@ class ChunkAuditLabeler:
                 needs_review=False,
                 rationale="Short structural label should remain as supporting evidence instead of becoming concept content.",
             )
+        if self._is_front_matter_label(
+            chunk_text=chunk_text,
+            token_count=token_count,
+            content_token_count=content_token_count,
+            chunk_size=chunk_size,
+        ) and proposition_score < 0.72:
+            return ChunkLabelDecision(
+                action="support_only",
+                confidence=0.92,
+                needs_review=False,
+                rationale="Front-matter or section-label chunk should remain structural support instead of becoming concept text.",
+            )
         if toc_score >= 0.78 and proposition_score < 0.72:
             return ChunkLabelDecision(
                 action="support_only",
@@ -485,10 +507,20 @@ class ChunkAuditLabeler:
         normalized = " ".join(chunk_text.split())
         if PUBLICATION_APPARATUS_PATTERN.search(normalized):
             return True
+        if FRONT_MATTER_LABEL_PATTERN.match(normalized):
+            return True
         if "@" in normalized:
             return True
         number_refs = len(re.findall(r"\b\d{1,2}\b", normalized))
         return token_count >= 12 and normalized.count(",") >= 8 and number_refs >= 4
+
+    def _is_front_matter_label(self, *, chunk_text: str, token_count: int, content_token_count: int, chunk_size: int) -> bool:
+        normalized = " ".join(chunk_text.split())
+        if FRONT_MATTER_LABEL_PATTERN.match(normalized):
+            return True
+        if token_count <= 8 and content_token_count <= 6 and chunk_size <= 2 and SECTION_HEADING_PATTERN.match(normalized):
+            return True
+        return False
 
     def _is_attach_left_closer(self, *, chunk_text: str) -> bool:
         normalized = " ".join(chunk_text.split())
