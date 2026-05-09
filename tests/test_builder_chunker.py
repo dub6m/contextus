@@ -317,6 +317,64 @@ def test_block_segmentation_does_not_fall_back_to_galloping_when_confidence_is_l
     assert "confidence=0.20" in groups[0].reason_summary
 
 
+def test_semantic_walk_refinement_splits_on_embedding_distance_outlier():
+    elements = [
+        make_element("text", 1, id="a", content="Alpha setup."),
+        make_element("text", 2, id="b", content="Alpha detail."),
+        make_element("text", 3, id="c", content="Alpha conclusion."),
+        make_element("text", 4, id="d", content="Beta setup."),
+        make_element("text", 5, id="e", content="Beta detail."),
+    ]
+    config = BuilderConfig(
+        SEMANTIC_WALK_BREAKPOINT_PERCENTILE=75,
+        SEMANTIC_WALK_MIN_BOUNDARIES=2,
+    )
+    chunker = make_chunker(llm_client=DummyLLM(), config=config, type_priors={("text", "text"): 0.5})
+    chunker._compute_similarity_stats = lambda texts: ([0.5] * 4, 0.5, 0.0)
+    chunker._embed_texts = lambda texts: __import__("numpy").array([
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+    ])
+
+    groups = chunker.build_refined_groups(
+        make_document(elements),
+        allow_llm=True,
+        refinement_strategy="semantic_walk",
+    )
+
+    assert [group.element_ids for group in groups] == [["a", "b", "c"], ["d", "e"]]
+    assert {group.search_strategy for group in groups} == {"semantic_walk"}
+    assert chunker.llm_calls == 0
+
+
+def test_semantic_walk_refinement_keeps_small_blocks_unsplit():
+    elements = [
+        make_element("text", 1, id="a", content="Alpha setup."),
+        make_element("text", 2, id="b", content="Beta setup."),
+    ]
+    config = BuilderConfig(SEMANTIC_WALK_MIN_BOUNDARIES=3)
+    chunker = make_chunker(llm_client=DummyLLM(), config=config, type_priors={("text", "text"): 0.5})
+    chunker._compute_similarity_stats = lambda texts: ([0.5], 0.5, 0.0)
+    chunker._embed_texts = lambda texts: __import__("numpy").array([
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ])
+
+    groups = chunker.build_refined_groups(
+        make_document(elements),
+        allow_llm=True,
+        refinement_strategy="level4",
+    )
+
+    assert [group.element_ids for group in groups] == [["a", "b"]]
+    assert groups[0].search_strategy == "semantic_walk"
+    assert "no breakpoint outliers" in groups[0].reason_summary
+    assert chunker.llm_calls == 0
+
+
 def test_local_audit_audits_non_overlapping_suspicious_chunks_concurrently():
     llm = SlowAuditLLM(delay=0.15)
     chunker = make_chunker(llm_client=llm)
@@ -820,6 +878,63 @@ def test_repaired_groups_llm_audit_moves_trailing_support_to_next_heading():
     assert 'Risk flags:' in llm.prompts[0]
     assert 'Same broad topic is not enough reason to move or merge elements.' in llm.prompts[0]
     assert 'Do not move edge elements if doing so leaves the current chunk heading-only' in llm.prompts[0]
+
+
+def test_repaired_groups_llm_audit_expands_context_on_wider_review():
+    elements = [
+        make_element('text', 1, id='prior-a', content='The previous topic is complete.'),
+        make_element('text', 2, id='prior-b', content='It does not mention DNA diagrams.'),
+        make_element('figure', 3, id='figure', content={'raw_text': 'A DNA double helix diagram'}),
+        make_element('title', 4, id='heading', content='DNA'),
+        make_element('text', 5, id='body', content='DNA stores inherited information.'),
+    ]
+    llm = QueueLLM(
+        '{"action":"needs_wider_review","confidence":0.9,"reason":"need the next body text","element_ids":[]}',
+        '{"action":"move_current_suffix_to_next","confidence":0.9,"reason":"the figure illustrates the expanded DNA section","element_ids":["figure"]}',
+    )
+    config = BuilderConfig(
+        LOCAL_AUDIT_EDGE_ELEMENTS=1,
+        LOCAL_AUDIT_MAX_CALLS=2,
+        CONTEXT_EXPANSION_MAX_ELEMENTS=3,
+    )
+    chunker = make_chunker(llm_client=llm, config=config)
+    views = [
+        chunker._element_view(element, chunker.preprocessor.to_text(element))
+        for element in elements
+    ]
+    groups = [
+        RefinedChunkGroup(
+            group_id='group-0',
+            group_index=0,
+            source_block_id='block-0',
+            elements=views[:3],
+            start_element_index=0,
+            end_element_index=2,
+            stability='likely_good',
+            reason_summary='test',
+        ),
+        RefinedChunkGroup(
+            group_id='group-1',
+            group_index=1,
+            source_block_id='block-0',
+            elements=views[3:],
+            start_element_index=3,
+            end_element_index=4,
+            stability='likely_good',
+            reason_summary='test',
+        ),
+    ]
+
+    repaired = chunker._llm_audit_repaired_groups(document_id='doc', groups=groups)
+
+    assert [group.element_ids for group in repaired] == [
+        ['prior-a', 'prior-b'],
+        ['figure', 'heading', 'body'],
+    ]
+    assert chunker.llm_calls == 2
+    assert 'N2. [id=body' not in llm.prompts[0]
+    assert 'expanded second-pass review' in llm.prompts[1]
+    assert 'N2. [id=body' in llm.prompts[1]
 
 
 def test_repaired_groups_llm_audit_rejects_low_confidence_action():

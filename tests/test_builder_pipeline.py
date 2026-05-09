@@ -1,4 +1,5 @@
 from contextus import Edge, Graph, Node, NodeType
+from contextus.builder.config import BuilderConfig
 from contextus.builder.pipeline import AutoGraphBuilder
 from contextus.ingestion.models import ExtractedDocument, ExtractedElement, ExtractedPage
 from contextus.llm import LLMResponse
@@ -69,3 +70,20 @@ def test_pipeline_builds_graph_and_prints_summary(capsys):
     assert 'LLM calls total:' in captured
     assert graph.metadata["node_candidate_count"] == 2
     assert graph.all_nodes()[0].metadata["node_candidate_index"] == 0
+
+
+def test_pipeline_records_configured_step5_strategy(capsys):
+    llm = FakeLLM([
+        '{"label":"Closest Pair","type":"definition","body":"Defines the closest pair problem.","scope":"Covers the closest pair problem definition only.","aliases":[]}',
+        '{"label":"Closest Pair Algorithm","type":"procedure","body":"Describes the closest pair algorithm.","scope":"Covers the closest pair algorithm steps only.","aliases":[]}',
+    ])
+    builder = AutoGraphBuilder(
+        llm_client=llm,
+        config=BuilderConfig(STEP5_REFINEMENT_STRATEGY="semantic_walk"),
+    )
+    builder.chunker._compute_similarity_stats = lambda texts: ([0.2], 0.2, 0.0)
+
+    graph = builder.build(make_document(), 'Closest Pair Algorithm')
+    capsys.readouterr()
+
+    assert graph.metadata["step5_refinement_strategy"] == "semantic_walk"

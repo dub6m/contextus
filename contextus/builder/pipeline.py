@@ -56,7 +56,10 @@ class AutoGraphBuilder:
         for element in ordered_elements:
             self.preprocessor.to_text(element)
 
-        chunks = self.chunker.build_repaired_groups(document)
+        chunks = self.chunker.build_repaired_groups(
+            document,
+            refinement_strategy=self.config.STEP5_REFINEMENT_STRATEGY,
+        )
         node_candidates = self.node_candidate_builder.build_candidates(document, chunks)
         nodes = self.node_builder.build_nodes(node_candidates)
         self.edge_builder.source_document = document.source_name
@@ -68,6 +71,7 @@ class AutoGraphBuilder:
             metadata={
                 "source_document": document.source_name,
                 "builder": "contextus.builder",
+                "step5_refinement_strategy": self.config.STEP5_REFINEMENT_STRATEGY,
                 "repaired_chunk_count": len(chunks),
                 "node_candidate_count": len(node_candidates),
                 "step7": "node_candidate_creation",

@@ -23,13 +23,22 @@ def main() -> None:
         action="store_true",
         help="Enable experimental Docling structural enrichment before role gating.",
     )
+    parser.add_argument(
+        "--step5-strategy",
+        choices=["galloping", "block", "semantic_walk", "semantic", "level4"],
+        default="galloping",
+        help="Step 5 refinement strategy to use before Step 6 repair.",
+    )
     args = parser.parse_args()
 
     extraction_path = Path(args.extraction)
     store = ExtractionArtifactStore(extraction_path.parent)
     document = store.load(extraction_path)
 
-    config = BuilderConfig(DOCLING_ENABLE_STRUCTURAL_ENRICHMENT=args.docling_structure)
+    config = BuilderConfig(
+        DOCLING_ENABLE_STRUCTURAL_ENRICHMENT=args.docling_structure,
+        STEP5_REFINEMENT_STRATEGY=args.step5_strategy,
+    )
     builder = AutoGraphBuilder(llm_client=CerebrasClient(), config=config)
     graph = builder.build(document=document, graph_name=args.name)
 

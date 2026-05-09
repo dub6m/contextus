@@ -477,7 +477,7 @@ class DocumentChunker:
         *,
         context_window: int | None = None,
         allow_llm: bool = True,
-        refinement_strategy: str = "galloping",
+        refinement_strategy: str | None = None,
     ) -> list[RefinedChunkGroup]:
         """Return concept-sized groups refined within tentative blocks."""
         tentative_blocks = self.build_tentative_blocks(document, context_window=context_window)
@@ -485,7 +485,7 @@ class DocumentChunker:
             document_id=document.id,
             tentative_blocks=tentative_blocks,
             allow_llm=allow_llm,
-            refinement_strategy=refinement_strategy,
+            refinement_strategy=refinement_strategy or self.config.STEP5_REFINEMENT_STRATEGY,
         )
 
     def build_repaired_groups(
@@ -494,7 +494,7 @@ class DocumentChunker:
         *,
         context_window: int | None = None,
         allow_llm: bool = True,
-        refinement_strategy: str = "galloping",
+        refinement_strategy: str | None = None,
     ) -> list[RefinedChunkGroup]:
         """Return Step 6 repaired groups after active refinement."""
         elements = self._sorted_elements(document)
@@ -523,7 +523,7 @@ class DocumentChunker:
             document_id=document.id,
             tentative_blocks=self.tentative_blocks,
             allow_llm=allow_llm,
-            refinement_strategy=refinement_strategy,
+            refinement_strategy=refinement_strategy or self.config.STEP5_REFINEMENT_STRATEGY,
         )
         repaired_groups = self._repair_refined_groups(
             document_id=document.id,
@@ -738,14 +738,17 @@ class DocumentChunker:
         document_id: str,
         tentative_blocks: list[TentativeBlock],
         allow_llm: bool,
-        refinement_strategy: str = "galloping",
+        refinement_strategy: str | None = None,
     ) -> list[RefinedChunkGroup]:
-        refinement_strategy = self._normalize_refinement_strategy(refinement_strategy)
+        refinement_strategy = self._normalize_refinement_strategy(
+            refinement_strategy or self.config.STEP5_REFINEMENT_STRATEGY
+        )
         if (
             allow_llm
             and self.llm_client is not None
             and len(tentative_blocks) > 1
             and int(self.config.MAX_LLM_CALLS_PER_BOUNDARY) > 0
+            and refinement_strategy != "semantic_walk"
         ):
             return self._build_refined_groups_concurrently(
                 document_id=document_id,
@@ -768,7 +771,9 @@ class DocumentChunker:
 
     def _normalize_refinement_strategy(self, refinement_strategy: str) -> str:
         strategy = (refinement_strategy or "galloping").strip().lower()
-        if strategy not in {"galloping", "block"}:
+        if strategy in {"semantic", "semantic_walk", "level4"}:
+            return "semantic_walk"
+        if strategy not in {"galloping", "block", "semantic_walk"}:
             raise ValueError(f"Unknown refinement strategy: {refinement_strategy}")
         return strategy
 
@@ -819,6 +824,12 @@ class DocumentChunker:
                 block=block,
                 first_group_index=first_group_index,
                 allow_llm=allow_llm,
+            )
+        if refinement_strategy == "semantic_walk":
+            return self._refine_tentative_block_by_semantic_walk(
+                document_id=document_id,
+                block=block,
+                first_group_index=first_group_index,
             )
         return self._refine_tentative_block(
             document_id=document_id,
@@ -1005,6 +1016,109 @@ class DocumentChunker:
             ).strip()
             groups.append(group)
         return groups
+
+    def _refine_tentative_block_by_semantic_walk(
+        self,
+        *,
+        document_id: str,
+        block: TentativeBlock,
+        first_group_index: int,
+    ) -> list[RefinedChunkGroup]:
+        if not block.elements:
+            return []
+        if not block.internal_boundaries:
+            return self._make_single_block_segmentation_group(
+                document_id=document_id,
+                block=block,
+                group_index=first_group_index,
+                search_strategy="semantic_walk_trivial",
+                reason="semantic_walk skipped; no internal boundaries",
+            )
+
+        distances = self._semantic_walk_distances(block.elements)
+        eligible_boundary_offsets = {
+            boundary.boundary_index - block.start_element_index
+            for boundary in block.internal_boundaries
+        }
+        if len(distances) < max(1, int(self.config.SEMANTIC_WALK_MIN_BOUNDARIES)):
+            split_offsets: list[int] = []
+            threshold = None
+        else:
+            threshold = float(
+                np.percentile(
+                    distances,
+                    max(0.0, min(100.0, float(self.config.SEMANTIC_WALK_BREAKPOINT_PERCENTILE))),
+                )
+            )
+            min_distance = max(0.0, float(self.config.SEMANTIC_WALK_MIN_DISTANCE))
+            split_offsets = [
+                distance_index + 1
+                for distance_index, distance in enumerate(distances)
+                if (
+                    distance_index in eligible_boundary_offsets
+                    and distance > threshold
+                    and distance >= min_distance
+                )
+            ]
+
+        if not split_offsets:
+            reason = "semantic_walk found no breakpoint outliers"
+            if threshold is not None:
+                reason = f"{reason}; threshold={threshold:.3f}"
+            return self._make_single_block_segmentation_group(
+                document_id=document_id,
+                block=block,
+                group_index=first_group_index,
+                search_strategy="semantic_walk",
+                reason=reason,
+            )
+
+        boundaries = [0, *split_offsets, len(block.elements)]
+        groups: list[RefinedChunkGroup] = []
+        threshold_note = f"{threshold:.3f}" if threshold is not None else "n/a"
+        split_start_ids = [block.elements[offset].element_id for offset in split_offsets]
+        for piece_index in range(len(boundaries) - 1):
+            group = self._make_refined_group(
+                document_id=document_id,
+                block=block,
+                group_index=first_group_index + piece_index,
+                start_offset=boundaries[piece_index],
+                end_offset=boundaries[piece_index + 1] - 1,
+                probe_decisions=[],
+            )
+            group.search_strategy = "semantic_walk"
+            group.reason_summary = (
+                f"semantic_walk threshold={threshold_note}; "
+                f"split_starts={','.join(split_start_ids)}"
+            )
+            groups.append(group)
+        return groups
+
+    def _semantic_walk_distances(self, elements: list[BoundaryElementView]) -> list[float]:
+        combined_texts = self._semantic_walk_combined_texts(elements)
+        if len(combined_texts) < 2:
+            return []
+        embeddings = self._embed_texts(combined_texts)
+        distances: list[float] = []
+        for index in range(len(embeddings) - 1):
+            similarity = float(np.dot(embeddings[index], embeddings[index + 1]))
+            distances.append(max(0.0, min(2.0, 1.0 - similarity)))
+        return distances
+
+    def _semantic_walk_combined_texts(self, elements: list[BoundaryElementView]) -> list[str]:
+        buffer_size = max(0, int(self.config.SEMANTIC_WALK_BUFFER_SIZE))
+        combined_texts: list[str] = []
+        for index in range(len(elements)):
+            start = max(0, index - buffer_size)
+            end = min(len(elements), index + buffer_size + 1)
+            combined_texts.append(
+                "\n".join(
+                    self._normalized_text(element.text)
+                    for element in elements[start:end]
+                    if self._normalized_text(element.text)
+                )
+            )
+        return combined_texts
 
     def _make_single_block_segmentation_group(
         self,
@@ -1282,6 +1396,21 @@ class DocumentChunker:
                 decision = self._parse_local_audit_response(content)
                 if decision.confidence < self.config.LOCAL_AUDIT_CONFIDENCE_THRESHOLD:
                     continue
+                if decision.action == "needs_wider_review" and audit_calls < max_calls:
+                    expanded_decision = self._run_expanded_local_audit(
+                        states=states,
+                        index=job.index,
+                        risk_flags=job.risk_flags,
+                        reason=decision.reason,
+                    )
+                    audit_calls += 1
+                    if (
+                        expanded_decision is not None
+                        and expanded_decision.confidence >= self.config.LOCAL_AUDIT_CONFIDENCE_THRESHOLD
+                    ):
+                        decision = expanded_decision
+                    if decision.confidence < self.config.LOCAL_AUDIT_CONFIDENCE_THRESHOLD:
+                        continue
                 self._apply_local_audit_decision(states, job.index, decision)
 
         return [
@@ -1393,6 +1522,46 @@ class DocumentChunker:
             results.append((job, getattr(response, "content", str(response))))
         return results
 
+    def _run_expanded_local_audit(
+        self,
+        *,
+        states: list[_RepairGroupState],
+        index: int,
+        risk_flags: list[str],
+        reason: str,
+    ) -> _LocalAuditDecision | None:
+        if index >= len(states) or not states[index].elements:
+            return None
+        base_edge_count = max(1, int(self.config.LOCAL_AUDIT_EDGE_ELEMENTS))
+        expanded_edge_count = max(
+            base_edge_count + 1,
+            int(self.config.CONTEXT_EXPANSION_MAX_ELEMENTS),
+        )
+        prompt = self._local_audit_prompt(
+            states,
+            index,
+            risk_flags,
+            edge_count=expanded_edge_count,
+            review_note=(
+                "This is an expanded second-pass review because the first local audit "
+                f"requested wider context: {reason or 'no reason provided'}"
+            ),
+        )
+        job = _LocalAuditJob(
+            index=index,
+            risk_flags=risk_flags,
+            signature=(
+                tuple(element.element_id for element in states[index].elements),
+                tuple([*risk_flags, "expanded_context_review"]),
+            ),
+            prompt=prompt,
+        )
+        responses = self._run_local_audit_jobs([job])
+        content = responses[0][1] if responses else None
+        if content is None:
+            return None
+        return self._parse_local_audit_response(content)
+
     def _local_audit_risk_flags(self, states: list[_RepairGroupState], index: int) -> list[str]:
         state = states[index]
         if not state.elements:
@@ -1436,13 +1605,17 @@ class DocumentChunker:
         states: list[_RepairGroupState],
         index: int,
         risk_flags: list[str],
+        *,
+        edge_count: int | None = None,
+        review_note: str = "",
     ) -> str:
-        edge_count = max(1, int(self.config.LOCAL_AUDIT_EDGE_ELEMENTS))
+        edge_count = max(1, int(self.config.LOCAL_AUDIT_EDGE_ELEMENTS) if edge_count is None else edge_count)
         previous_elements = states[index - 1].elements[-edge_count:] if index > 0 else []
         current_elements = states[index].elements
         next_elements = states[index + 1].elements[:edge_count] if index + 1 < len(states) else []
 
         risk_lines = [f"- {flag.replace('_', ' ')}" for flag in risk_flags]
+        review_note_lines = [review_note, ""] if review_note else []
         action_lines = [
             "- keep: the current chunk is acceptable.",
             "- move_current_prefix_to_previous: the first one or more current elements belong at the end of the previous chunk.",
@@ -1456,6 +1629,7 @@ class DocumentChunker:
             [
                 "You are auditing one proposed document chunk before it becomes input for a knowledge-building system.",
                 "",
+                *review_note_lines,
                 "The system turns chunks into small knowledge units.",
                 "A useful small knowledge unit should let a later model write one clear concept, claim, definition, procedure step, example, relationship, or support/evidence item without inventing missing context.",
                 "A good chunk usually has one main idea or object, is complete enough to understand locally, and keeps figures, tables, formulas, captions, or examples with the text they support.",
