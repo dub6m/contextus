@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import Counter
-from pathlib import Path
 
 from contextus import Graph
 from contextus.ingestion.models import ExtractedDocument
@@ -10,11 +9,10 @@ from contextus.llm import LLMClient
 from .audit import ChunkAuditExporter
 from .chunker import DocumentChunker
 from .config import BuilderConfig
-from .consolidation import ChunkConsolidator
 from .edge_builder import EdgeBuilder
+from .node_candidate import NodeCandidateBuilder
 from .node_builder import NodeBuilder
 from .preprocessor import ElementPreprocessor
-from .training import ChunkActionModel
 
 
 class AutoGraphBuilder:
@@ -24,7 +22,6 @@ class AutoGraphBuilder:
         self,
         llm_client: LLMClient,
         config: BuilderConfig | None = None,
-        chunk_action_model: ChunkActionModel | None = None,
     ) -> None:
         """Create a builder pipeline backed by one shared LLM client."""
         self.llm_client = llm_client
@@ -40,16 +37,11 @@ class AutoGraphBuilder:
             preprocessor=self.preprocessor,
             config=self.config,
         )
-        self.chunk_action_model = chunk_action_model or self._load_chunk_action_model()
-        self.consolidator = ChunkConsolidator(
-            chunk_action_model=self.chunk_action_model,
-            audit_exporter=self.audit_exporter,
-            preprocessor=self.preprocessor,
-        )
         self.node_builder = NodeBuilder(
             llm_client=llm_client,
             preprocessor=self.preprocessor,
         )
+        self.node_candidate_builder = NodeCandidateBuilder(preprocessor=self.preprocessor)
         self.edge_builder = EdgeBuilder(
             llm_client=llm_client,
             config=self.config,
@@ -64,9 +56,9 @@ class AutoGraphBuilder:
         for element in ordered_elements:
             self.preprocessor.to_text(element)
 
-        chunks = self.chunker.chunk(document)
-        consolidated_chunks = self.consolidator.consolidate(document, chunks)
-        nodes = self.node_builder.build_nodes(consolidated_chunks)
+        chunks = self.chunker.build_repaired_groups(document)
+        node_candidates = self.node_candidate_builder.build_candidates(document, chunks)
+        nodes = self.node_builder.build_nodes(node_candidates)
         self.edge_builder.source_document = document.source_name
         edges = self.edge_builder.build_edges(nodes)
 
@@ -76,26 +68,10 @@ class AutoGraphBuilder:
             metadata={
                 "source_document": document.source_name,
                 "builder": "contextus.builder",
-                "raw_chunk_count": len(chunks),
-                "canonical_chunk_count": len(consolidated_chunks),
-                "predicted_chunk_actions": dict(self.consolidator.last_action_counts),
-                "effective_chunk_actions": dict(self.consolidator.last_effective_action_counts),
-                "chunk_action_model": type(self.chunk_action_model).__name__ if self.chunk_action_model is not None else None,
-                "document_supporting_evidence_count": len(self.consolidator.last_orphan_support_segments),
-                "document_supporting_evidence": [
-                    {
-                        "chunk_index": segment.chunk_index,
-                        "action": segment.action,
-                        "source": segment.source,
-                        "confidence": segment.confidence,
-                        "needs_review": segment.needs_review,
-                        "page_numbers": segment.page_numbers(),
-                        "element_ids": segment.element_ids(),
-                        "text": segment.text,
-                        "rationale": segment.rationale,
-                    }
-                    for segment in self.consolidator.last_orphan_support_segments
-                ],
+                "repaired_chunk_count": len(chunks),
+                "node_candidate_count": len(node_candidates),
+                "step7": "node_candidate_creation",
+                "node_candidate_quality_counts": self._node_candidate_quality_counts(node_candidates),
             },
         )
         for node in nodes:
@@ -115,19 +91,17 @@ class AutoGraphBuilder:
             f"Tier 2: {counts.get('2', 0)}"
         )
         print(
-            "Consolidation: "
-            f"{len(chunks)} raw chunks -> {len(consolidated_chunks)} canonical chunks | "
-            f"predicted={dict(self.consolidator.last_action_counts)} | "
-            f"effective={dict(self.consolidator.last_effective_action_counts)}"
+            "Step 7 node candidates: "
+            f"{len(chunks)} repaired chunks -> {len(node_candidates)} node candidates | "
+            f"quality_flags={self._node_candidate_quality_counts(node_candidates)}"
         )
         print(f"LLM calls total: {total_llm_calls}")
         return graph
 
-    def _load_chunk_action_model(self) -> ChunkActionModel | None:
-        path = Path(self.config.CHUNK_ACTION_MODEL_PATH)
-        if not path.exists():
-            return None
-        try:
-            return ChunkActionModel.load(path)
-        except Exception:
-            return None
+    def _node_candidate_quality_counts(self, node_candidates) -> dict[str, int]:
+        counts: Counter[str] = Counter()
+        for candidate in node_candidates:
+            for flag, enabled in candidate.quality_flags.items():
+                if enabled:
+                    counts[flag] += 1
+        return dict(counts)

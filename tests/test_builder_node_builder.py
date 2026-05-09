@@ -1,16 +1,35 @@
-from contextus.builder.consolidation import ConsolidatedChunk, EvidenceChunk
+from contextus.builder.node_candidate import NodeCandidate
 from contextus.builder.node_builder import NodeBuilder
 from contextus.ingestion.models import ExtractedElement
 from contextus.llm import LLMResponse
 from contextus.node import NodeType
+import time
 
 
 class FakeLLM:
     def __init__(self, responses):
         self.responses = list(responses)
+        self.prompts = []
 
     def complete(self, system: str, user: str, temperature: float = 0.0):
+        self.prompts.append(user)
         return LLMResponse(content=self.responses.pop(0))
+
+
+class SlowNodeLLM:
+    def __init__(self, delay: float = 0.15):
+        self.delay = delay
+
+    def complete(self, system: str, user: str, temperature: float = 0.0, **kwargs):
+        time.sleep(self.delay)
+        label = " ".join(user.split()[:2]) or "Node"
+        return LLMResponse(
+            content=(
+                '{"label":"'
+                + label.replace('"', '')
+                + '","type":"definition","body":"Generated body.","scope":"Generated scope.","aliases":[]}'
+            )
+        )
 
 
 def make_element(element_id: str, page: int = 1, order: int = 1, content: str = 'content', element_type: str = 'text') -> ExtractedElement:
@@ -54,56 +73,6 @@ def test_node_builder_falls_back_to_stub_on_parse_failure():
     assert nodes[0].body == 'Fallback body text'
 
 
-def test_node_builder_metadata_contains_supporting_evidence_for_consolidated_chunks():
-    llm = FakeLLM([
-        '{"label":"Closest Pair","type":"definition","body":"Defines the closest pair problem.","scope":"Covers the closest pair problem definition only.","aliases":[]}'
-    ])
-    builder = NodeBuilder(llm)
-    consolidated = ConsolidatedChunk(
-        canonical_chunk_index=1,
-        segments=[
-            EvidenceChunk(
-                chunk_index=0,
-                action='attach_right',
-                confidence=0.94,
-                needs_review=False,
-                used_for_node_text=True,
-                elements=[make_element('a', order=1, content='Algorithm', element_type='title')],
-                text='Algorithm',
-                source='attached',
-                rationale='heading_like',
-            ),
-            EvidenceChunk(
-                chunk_index=1,
-                action='standalone',
-                confidence=0.91,
-                needs_review=False,
-                used_for_node_text=True,
-                elements=[make_element('b', order=2, content='Closest pair definition')],
-                text='Closest pair definition',
-                source='primary',
-            ),
-            EvidenceChunk(
-                chunk_index=2,
-                action='duplicate_drop',
-                confidence=0.95,
-                needs_review=False,
-                used_for_node_text=False,
-                elements=[make_element('c', order=3, content='Closest pair definition')],
-                text='Closest pair definition',
-                source='support',
-            ),
-        ],
-    )
-
-    nodes = builder.build_nodes([consolidated])
-
-    assert nodes[0].metadata['source_element_ids'] == ['a', 'b']
-    assert nodes[0].metadata['canonical_chunk_index'] == 1
-    assert nodes[0].metadata['supporting_evidence_count'] == 2
-    assert nodes[0].metadata['supporting_evidence'][1]['element_ids'] == ['c']
-
-
 def test_node_builder_metadata_contains_source_element_ids():
     llm = FakeLLM([
         '{"label":"Closest Pair","type":"definition","body":"Defines the closest pair problem.","scope":"Covers the closest pair problem definition only.","aliases":[]}'
@@ -116,3 +85,48 @@ def test_node_builder_metadata_contains_source_element_ids():
     assert nodes[0].metadata['source_element_ids'] == ['a', 'b']
     assert nodes[0].metadata['source_page_numbers'] == [1, 2]
     assert nodes[0].metadata['chunk_size'] == 2
+
+
+def test_node_builder_uses_node_candidate_context_and_metadata():
+    llm = FakeLLM([
+        '{"label":"Punnett Square","type":"example","body":"Shows how a Punnett square represents inheritance outcomes.","scope":"Covers the Punnett square example in this chunk only.","aliases":[]}'
+    ])
+    builder = NodeBuilder(llm)
+    element = make_element('a', content='Figure: Punnett square inheritance outcomes', element_type='figure')
+    candidate = NodeCandidate(
+        candidate_id='node-candidate-00000',
+        candidate_index=0,
+        elements=[element],
+        text='Figure: Punnett square inheritance outcomes',
+        title='Punnett Square',
+        summary='Figure: Punnett square inheritance outcomes',
+        source_page_numbers=[1],
+        source_element_ids=['a'],
+        element_types=['figure'],
+        quality_flags={'mostly_visual': True},
+        metadata={'step7_source': 'repaired_group'},
+    )
+
+    nodes = builder.build_nodes([candidate])
+
+    assert 'Candidate title: Punnett Square' in llm.prompts[0]
+    assert nodes[0].metadata['node_candidate_id'] == 'node-candidate-00000'
+    assert nodes[0].metadata['node_candidate_quality_flags'] == {'mostly_visual': True}
+
+
+def test_node_builder_builds_independent_nodes_concurrently():
+    llm = SlowNodeLLM(delay=0.15)
+    builder = NodeBuilder(llm)
+    chunks = [
+        [make_element("a", content="Alpha concept")],
+        [make_element("b", content="Beta concept")],
+        [make_element("c", content="Gamma concept")],
+    ]
+
+    started = time.perf_counter()
+    nodes = builder.build_nodes(chunks)
+    elapsed = time.perf_counter() - started
+
+    assert len(nodes) == 3
+    assert builder.llm_calls == 3
+    assert elapsed < 0.35

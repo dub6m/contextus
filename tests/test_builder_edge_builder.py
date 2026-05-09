@@ -1,7 +1,8 @@
 from contextus.builder.edge_builder import EdgeBuilder
 from contextus.builder.config import BuilderConfig
-from contextus.llm import LLMResponse
+from contextus.llm import LLMClient, LLMResponse
 from contextus.node import Node, NodeType
+import time
 
 
 class FakeLLM:
@@ -11,6 +12,15 @@ class FakeLLM:
     def complete(self, system: str, user: str, temperature: float = 0.0):
         response = self.responses.pop(0) if self.responses else 'RELATES_TO'
         return LLMResponse(content=response)
+
+
+class SlowRelationLLM(LLMClient):
+    def __init__(self, delay: float = 0.15):
+        self.delay = delay
+
+    def complete(self, system: str, user: str, temperature: float = 0.0, **kwargs):
+        time.sleep(self.delay)
+        return LLMResponse(content="RELATES_TO")
 
 
 def make_node(name: str) -> Node:
@@ -67,3 +77,25 @@ def test_edge_builder_defaults_unknown_llm_response_safely():
     semantic = [edge for edge in edges if edge.metadata.get('kind') == 'semantic']
     assert semantic
     assert all(edge.relations == ['relates_to'] for edge in semantic)
+
+
+def test_edge_builder_classifies_independent_semantic_edges_concurrently():
+    config = BuilderConfig(MAX_SEMANTIC_EDGES_PER_NODE=1, SEMANTIC_EDGE_THRESHOLD=0.1)
+    builder = EdgeBuilder(llm_client=SlowRelationLLM(delay=0.15), config=config)
+    nodes = [make_node(f'N{i}') for i in range(5)]
+    builder._embed_texts = lambda texts: __import__('numpy').array([
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [1.0, 0.0],
+    ])
+
+    started = time.perf_counter()
+    edges = builder.build_edges(nodes)
+    elapsed = time.perf_counter() - started
+
+    semantic = [edge for edge in edges if edge.metadata.get('kind') == 'semantic']
+    assert len(semantic) >= 3
+    assert builder.llm_calls == len(semantic)
+    assert elapsed < 0.35

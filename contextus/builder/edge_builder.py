@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Iterable
 import math
 
@@ -9,6 +10,9 @@ from contextus import Edge, Node
 from contextus.llm import LLMClient
 
 from .config import BuilderConfig
+
+
+_EDGE_FALLBACK_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="contextus-edge-builder")
 
 
 class EdgeBuilder:
@@ -62,6 +66,7 @@ class EdgeBuilder:
         embeddings = self._embed_texts(texts)
         similarity_matrix = embeddings @ embeddings.T
 
+        semantic_specs = []
         for source_index, source_node in enumerate(nodes):
             candidates: list[tuple[float, int]] = []
             for target_index, target_node in enumerate(nodes):
@@ -78,21 +83,32 @@ class EdgeBuilder:
             for similarity, target_index in candidates:
                 if created >= self.config.MAX_SEMANTIC_EDGES_PER_NODE:
                     break
-                relation = self._classify_relation(source_node, nodes[target_index])
-                edges.append(
-                    Edge(
-                        source_id=source_node.id,
-                        target_id=nodes[target_index].id,
-                        relations=[relation],
-                        base_weight=0.7,
-                        metadata={
-                            "source_document": self.source_document,
-                            "kind": "semantic",
-                            "similarity": similarity,
-                        },
-                    )
-                )
+                semantic_specs.append((source_node, nodes[target_index], similarity))
                 created += 1
+        futures = [
+            (source_node, target_node, similarity, self._submit_relation_classification(source_node, target_node))
+            for source_node, target_node, similarity in semantic_specs
+        ]
+        self.llm_calls += len(futures)
+        for source_node, target_node, similarity, future in futures:
+            try:
+                response = future.result().content.strip().upper()
+            except Exception:
+                response = ""
+            relation = self.RELATION_MAP.get(response, "relates_to")
+            edges.append(
+                Edge(
+                    source_id=source_node.id,
+                    target_id=target_node.id,
+                    relations=[relation],
+                    base_weight=0.7,
+                    metadata={
+                        "source_document": self.source_document,
+                        "kind": "semantic",
+                        "similarity": similarity,
+                    },
+                )
+            )
         return edges
 
     def _node_text(self, node: Node) -> str:
@@ -120,7 +136,7 @@ class EdgeBuilder:
             self._embedder = SentenceTransformer(self.config.EMBEDDING_FALLBACK)
         return self._embedder
 
-    def _classify_relation(self, source: Node, target: Node) -> str:
+    def _relation_prompt(self, source: Node, target: Node) -> tuple[str, str]:
         system = "You are a precise knowledge graph relationship classifier."
         user = (
             "Given these two knowledge graph nodes:\n\n"
@@ -131,6 +147,17 @@ class EdgeBuilder:
             "DEFINES, EXTENDS, CONTRADICTS, REQUIRES, EXEMPLIFIES, CAUSES, CONSTRAINS, RELATES_TO\n\n"
             "Reply with exactly one word."
         )
+        return system, user
+
+    def _submit_relation_classification(self, source: Node, target: Node) -> Future:
+        system, user = self._relation_prompt(source, target)
+        submit = getattr(self.llm_client, "submit", None)
+        if callable(submit):
+            return submit(system=system, user=user, temperature=0.0)
+        return _EDGE_FALLBACK_EXECUTOR.submit(self.llm_client.complete, system, user, 0.0)
+
+    def _classify_relation(self, source: Node, target: Node) -> str:
+        system, user = self._relation_prompt(source, target)
         self.llm_calls += 1
         response = self.llm_client.complete(system=system, user=user, temperature=0.0).content.strip().upper()
         return self.RELATION_MAP.get(response, "relates_to")

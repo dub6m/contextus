@@ -13,15 +13,6 @@ class FakeLLM:
         return LLMResponse(content=response)
 
 
-
-
-class FakeChunkActionModel:
-    def __init__(self, predictions):
-        self.predictions = dict(predictions)
-
-    def predict_row(self, row):
-        return dict(self.predictions[row["chunk_index"]])
-
 def make_document() -> ExtractedDocument:
     elements = [
         ExtractedElement(
@@ -64,7 +55,7 @@ def test_pipeline_builds_graph_and_prints_summary(capsys):
         '{"label":"Closest Pair","type":"definition","body":"Defines the closest pair problem.","scope":"Covers the closest pair problem definition only.","aliases":[]}',
         '{"label":"Closest Pair Algorithm","type":"procedure","body":"Describes the closest pair algorithm.","scope":"Covers the closest pair algorithm steps only.","aliases":[]}',
     ])
-    builder = AutoGraphBuilder(llm_client=llm, chunk_action_model=FakeChunkActionModel({0: {"action": "standalone", "confidence": 0.9, "needs_review": False}, 1: {"action": "standalone", "confidence": 0.9, "needs_review": False}}))
+    builder = AutoGraphBuilder(llm_client=llm)
     builder.chunker._compute_similarity_stats = lambda texts: ([0.2], 0.2, 0.0)
 
     graph = builder.build(make_document(), 'Closest Pair Algorithm')
@@ -74,5 +65,7 @@ def test_pipeline_builds_graph_and_prints_summary(capsys):
     assert graph.edge_count() == 1
     assert "Built graph 'Closest Pair Algorithm': 2 nodes, 1 edges" in captured
     assert 'Chunking:' in captured
-    assert 'Consolidation:' in captured
+    assert 'Step 7 node candidates:' in captured
     assert 'LLM calls total:' in captured
+    assert graph.metadata["node_candidate_count"] == 2
+    assert graph.all_nodes()[0].metadata["node_candidate_index"] == 0
