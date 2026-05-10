@@ -315,6 +315,8 @@ class _LexicalCrossEncoder:
 class DocumentChunker:
     """Partitions a document into contiguous concept-sized element groups."""
 
+    PROPOSITION_PROMPT_VERSION = "proposition_walk_v1"
+
     DEFAULT_TYPE_PRIORS: dict[tuple[str, str], float] = {
         ("text", "text"): 0.7,
         ("text", "formula"): 0.8,
@@ -353,8 +355,12 @@ class DocumentChunker:
         self._cross_encoder = None
         self._refinement_response_cache: dict[str, str] = {}
         self._refinement_response_cache_lock = threading.Lock()
+        self._proposition_cache: dict[str, list[str]] = {}
+        self._proposition_cache_lock = threading.Lock()
         self._llm_calls_lock = threading.Lock()
         self.llm_calls = 0
+        self.proposition_cache_hits = 0
+        self.proposition_cache_misses = 0
         self.recoverable_errors: list[str] = []
 
     def chunk(self, document: ExtractedDocument) -> list[list[ExtractedElement]]:
@@ -773,7 +779,7 @@ class DocumentChunker:
         strategy = (refinement_strategy or "galloping").strip().lower()
         if strategy in {"semantic", "semantic_walk", "level4"}:
             return "semantic_walk"
-        if strategy not in {"galloping", "block", "semantic_walk"}:
+        if strategy not in {"galloping", "block", "semantic_walk", "proposition_walk"}:
             raise ValueError(f"Unknown refinement strategy: {refinement_strategy}")
         return strategy
 
@@ -830,6 +836,13 @@ class DocumentChunker:
                 document_id=document_id,
                 block=block,
                 first_group_index=first_group_index,
+            )
+        if refinement_strategy == "proposition_walk":
+            return self._refine_tentative_block_by_proposition_walk(
+                document_id=document_id,
+                block=block,
+                first_group_index=first_group_index,
+                allow_llm=allow_llm,
             )
         return self._refine_tentative_block(
             document_id=document_id,
@@ -1023,6 +1036,8 @@ class DocumentChunker:
         document_id: str,
         block: TentativeBlock,
         first_group_index: int,
+        element_texts: list[str] | None = None,
+        search_strategy: str = "semantic_walk",
     ) -> list[RefinedChunkGroup]:
         if not block.elements:
             return []
@@ -1031,11 +1046,11 @@ class DocumentChunker:
                 document_id=document_id,
                 block=block,
                 group_index=first_group_index,
-                search_strategy="semantic_walk_trivial",
-                reason="semantic_walk skipped; no internal boundaries",
+                search_strategy=f"{search_strategy}_trivial",
+                reason=f"{search_strategy} skipped; no internal boundaries",
             )
 
-        distances = self._semantic_walk_distances(block.elements)
+        distances = self._semantic_walk_distances(block.elements, element_texts=element_texts)
         eligible_boundary_offsets = {
             boundary.boundary_index - block.start_element_index
             for boundary in block.internal_boundaries
@@ -1062,14 +1077,14 @@ class DocumentChunker:
             ]
 
         if not split_offsets:
-            reason = "semantic_walk found no breakpoint outliers"
+            reason = f"{search_strategy} found no breakpoint outliers"
             if threshold is not None:
                 reason = f"{reason}; threshold={threshold:.3f}"
             return self._make_single_block_segmentation_group(
                 document_id=document_id,
                 block=block,
                 group_index=first_group_index,
-                search_strategy="semantic_walk",
+                search_strategy=search_strategy,
                 reason=reason,
             )
 
@@ -1086,16 +1101,67 @@ class DocumentChunker:
                 end_offset=boundaries[piece_index + 1] - 1,
                 probe_decisions=[],
             )
-            group.search_strategy = "semantic_walk"
+            group.search_strategy = search_strategy
             group.reason_summary = (
-                f"semantic_walk threshold={threshold_note}; "
+                f"{search_strategy} threshold={threshold_note}; "
                 f"split_starts={','.join(split_start_ids)}"
             )
             groups.append(group)
         return groups
 
-    def _semantic_walk_distances(self, elements: list[BoundaryElementView]) -> list[float]:
-        combined_texts = self._semantic_walk_combined_texts(elements)
+    def _refine_tentative_block_by_proposition_walk(
+        self,
+        *,
+        document_id: str,
+        block: TentativeBlock,
+        first_group_index: int,
+        allow_llm: bool,
+    ) -> list[RefinedChunkGroup]:
+        if not block.elements:
+            return []
+        if not block.internal_boundaries:
+            return self._make_single_block_segmentation_group(
+                document_id=document_id,
+                block=block,
+                group_index=first_group_index,
+                search_strategy="proposition_walk_trivial",
+                reason="proposition_walk skipped; no internal boundaries",
+            )
+        if not allow_llm:
+            self.recoverable_errors.append(
+                f"Proposition generation skipped for {block.block_id}; fell back to semantic_walk because LLM refinement is disabled"
+            )
+            return self._refine_tentative_block_by_semantic_walk(
+                document_id=document_id,
+                block=block,
+                first_group_index=first_group_index,
+            )
+        try:
+            proposition_texts = self._proposition_texts_for_block(block)
+        except Exception as exc:
+            self.recoverable_errors.append(
+                f"Proposition generation failed for {block.block_id}; fell back to semantic_walk: {exc}"
+            )
+            return self._refine_tentative_block_by_semantic_walk(
+                document_id=document_id,
+                block=block,
+                first_group_index=first_group_index,
+            )
+        return self._refine_tentative_block_by_semantic_walk(
+            document_id=document_id,
+            block=block,
+            first_group_index=first_group_index,
+            element_texts=proposition_texts,
+            search_strategy="proposition_walk",
+        )
+
+    def _semantic_walk_distances(
+        self,
+        elements: list[BoundaryElementView],
+        *,
+        element_texts: list[str] | None = None,
+    ) -> list[float]:
+        combined_texts = self._semantic_walk_combined_texts(elements, element_texts=element_texts)
         if len(combined_texts) < 2:
             return []
         embeddings = self._embed_texts(combined_texts)
@@ -1105,20 +1171,205 @@ class DocumentChunker:
             distances.append(max(0.0, min(2.0, 1.0 - similarity)))
         return distances
 
-    def _semantic_walk_combined_texts(self, elements: list[BoundaryElementView]) -> list[str]:
+    def _semantic_walk_combined_texts(
+        self,
+        elements: list[BoundaryElementView],
+        *,
+        element_texts: list[str] | None = None,
+    ) -> list[str]:
         buffer_size = max(0, int(self.config.SEMANTIC_WALK_BUFFER_SIZE))
+        source_texts = (
+            [self._normalized_text(text) for text in element_texts]
+            if element_texts is not None
+            else [self._normalized_text(element.text) for element in elements]
+        )
         combined_texts: list[str] = []
         for index in range(len(elements)):
             start = max(0, index - buffer_size)
             end = min(len(elements), index + buffer_size + 1)
             combined_texts.append(
                 "\n".join(
-                    self._normalized_text(element.text)
-                    for element in elements[start:end]
-                    if self._normalized_text(element.text)
+                    text
+                    for text in source_texts[start:end]
+                    if text
                 )
             )
         return combined_texts
+
+    def _proposition_texts_for_block(self, block: TentativeBlock) -> list[str]:
+        if self.llm_client is None:
+            raise ValueError("LLM client unavailable")
+
+        cached_by_id: dict[str, list[str]] = {}
+        missing_elements: list[BoundaryElementView] = []
+        with self._proposition_cache_lock:
+            for element in block.elements:
+                cache_key = self._proposition_cache_key(element)
+                cached = self._proposition_cache.get(cache_key)
+                if cached is None:
+                    missing_elements.append(element)
+                else:
+                    self.proposition_cache_hits += 1
+                    cached_by_id[element.element_id] = list(cached)
+
+        if missing_elements:
+            response = self.llm_client.complete(
+                system=(
+                    "You decompose document content into standalone propositions. "
+                    "Return only JSON matching the requested schema."
+                ),
+                user=self._proposition_generation_prompt(missing_elements),
+                temperature=0.0,
+                response_format=self._proposition_response_format(),
+            )
+            self._record_llm_call()
+            parsed = self._parse_proposition_response(getattr(response, "content", str(response)))
+            if parsed is None:
+                raise ValueError("LLM did not return proposition JSON")
+
+            missing_ids = [element.element_id for element in missing_elements if element.element_id not in parsed]
+            if missing_ids:
+                raise ValueError(f"LLM omitted proposition entries for: {', '.join(missing_ids[:5])}")
+
+            with self._proposition_cache_lock:
+                for element in missing_elements:
+                    propositions = list(parsed.get(element.element_id, []))
+                    self._proposition_cache[self._proposition_cache_key(element)] = propositions
+                    self.proposition_cache_misses += 1
+                    cached_by_id[element.element_id] = propositions
+
+        return [
+            self._proposition_text_for_element(
+                element=element,
+                propositions=cached_by_id.get(element.element_id, []),
+            )
+            for element in block.elements
+        ]
+
+    def _proposition_generation_prompt(self, elements: list[BoundaryElementView]) -> str:
+        lines: list[str] = []
+        for element in elements:
+            text = self._normalized_text(element.text)
+            if len(text) > 1600:
+                text = text[:1597].rstrip() + "..."
+            lines.extend(
+                [
+                    f"Element ID: {element.element_id}",
+                    f"Type: {element.element_type}",
+                    f"Page: {element.page_number}",
+                    f"Content: {text}",
+                    "",
+                ]
+            )
+        return "\n".join(
+            [
+                'Decompose each "Content" into clear and simple propositions, ensuring they are interpretable out of context.',
+                "1. Split compound sentence into simple sentences. Maintain the original phrasing from the input whenever possible.",
+                "2. For any named entity that is accompanied by additional descriptive information, separate this information into its own distinct proposition.",
+                '3. Decontextualize the proposition by adding necessary modifier to nouns or entire sentences and replacing pronouns such as "it", "he", "she", "they", "this", and "that" with the full name of the entities they refer to.',
+                "4. Present the results as JSON.",
+                "",
+                "Return one entry for every Element ID. Each entry must contain the exact element_id and a propositions array of strings.",
+                "Use an empty propositions array only when the content has no meaningful proposition.",
+                "",
+                "Elements:",
+                self._join_prompt_lines(lines),
+            ]
+        )
+
+    def _proposition_response_format(self) -> dict[str, Any]:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "element_propositions",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "elements": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "element_id": {"type": "string"},
+                                    "propositions": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                                "required": ["element_id", "propositions"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["elements"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def _parse_proposition_response(self, content: str) -> dict[str, list[str]] | None:
+        payload = self._extract_json_payload(content)
+        if payload is None:
+            return None
+
+        items: list[Any]
+        if isinstance(payload, list):
+            items = payload
+        elif isinstance(payload, dict) and isinstance(payload.get("elements"), list):
+            items = payload["elements"]
+        elif isinstance(payload, dict) and "element_id" in payload:
+            items = [payload]
+        elif isinstance(payload, dict):
+            parsed_mapping: dict[str, list[str]] = {}
+            for element_id, propositions in payload.items():
+                if isinstance(propositions, list):
+                    parsed_mapping[str(element_id)] = self._clean_propositions(propositions)
+            return parsed_mapping
+        else:
+            return None
+
+        parsed: dict[str, list[str]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            element_id = str(item.get("element_id") or "").strip()
+            if not element_id:
+                continue
+            propositions = item.get("propositions", item.get("sentences", []))
+            if not isinstance(propositions, list):
+                propositions = []
+            parsed[element_id] = self._clean_propositions(propositions)
+        return parsed
+
+    def _clean_propositions(self, propositions: list[Any]) -> list[str]:
+        cleaned: list[str] = []
+        for proposition in propositions:
+            text = self._normalized_text(str(proposition))
+            if text:
+                cleaned.append(text)
+        return cleaned
+
+    def _proposition_text_for_element(
+        self,
+        *,
+        element: BoundaryElementView,
+        propositions: list[str],
+    ) -> str:
+        cleaned = [self._normalized_text(proposition) for proposition in propositions if self._normalized_text(proposition)]
+        if cleaned:
+            return "\n".join(cleaned)
+        return self._normalized_text(element.text)
+
+    def _proposition_cache_key(self, element: BoundaryElementView) -> str:
+        payload = "\n".join(
+            [
+                self.PROPOSITION_PROMPT_VERSION,
+                element.element_id,
+                self._normalized_text(element.text),
+            ]
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _make_single_block_segmentation_group(
         self,
@@ -3138,19 +3389,21 @@ class DocumentChunker:
         )
 
     def _extract_json_object(self, content: str) -> dict[str, Any] | None:
+        parsed = self._extract_json_payload(content)
+        return parsed if isinstance(parsed, dict) else None
+
+    def _extract_json_payload(self, content: str) -> Any | None:
         text = (content or "").strip()
         try:
-            parsed = json.loads(text)
-            return parsed if isinstance(parsed, dict) else None
+            return json.loads(text)
         except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+            match = re.search(r"(\{.*\}|\[.*\])", text, flags=re.DOTALL)
             if match is None:
                 return None
             try:
-                parsed = json.loads(match.group(0))
+                return json.loads(match.group(0))
             except json.JSONDecodeError:
                 return None
-            return parsed if isinstance(parsed, dict) else None
 
     def _safe_context_request_count(self, value: Any, default: int) -> int:
         try:

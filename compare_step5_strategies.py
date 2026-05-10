@@ -39,15 +39,15 @@ def main() -> None:
         "--strategy",
         "-s",
         action="append",
-        choices=["block", "semantic_walk", "level4", "semantic"],
-        help="Strategy to compare. Defaults to block and level4.",
+        choices=["block", "galloping", "semantic_walk", "level4", "semantic", "proposition_walk"],
+        help="Strategy to compare. Defaults to block, level4, and proposition_walk.",
     )
     parser.add_argument("--outdir", "-o", type=Path, help="Output directory under chunk_runs.")
     parser.add_argument("--skip-step6-llm", action="store_true", help="Run only heuristic Step 6 repair.")
     args = parser.parse_args()
 
     extraction_paths = args.extraction or DEFAULT_EXTRACTIONS
-    strategies = args.strategy or ["block", "level4"]
+    strategies = args.strategy or ["block", "level4", "proposition_walk"]
     outdir = args.outdir or Path("chunk_runs") / f"block_vs_level4_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -102,6 +102,7 @@ def main() -> None:
 
     write_json(outdir / "summary.json", summary)
     (outdir / "summary.md").write_text(render_summary_markdown(summary), encoding="utf-8")
+    (outdir / "qualitative_review_template.md").write_text(render_qualitative_review_template(summary), encoding="utf-8")
     print(f"Saved comparison artifacts to: {outdir}")
 
 
@@ -149,6 +150,8 @@ def run_strategy(
             "llm_calls_total": chunker.llm_calls,
             "llm_calls_step5": step5_llm_calls,
             "llm_calls_step6": chunker.llm_calls - step5_llm_calls,
+            "proposition_cache_hits": chunker.proposition_cache_hits,
+            "proposition_cache_misses": chunker.proposition_cache_misses,
             "recoverable_errors": step5_recoverable_errors + list(chunker.recoverable_errors),
             "step5": summarize_payloads(step5_payload),
             "step6": summarize_payloads(step6_payload, chunker=chunker),
@@ -303,11 +306,45 @@ def render_summary_markdown(summary: dict[str, object]) -> str:
                         f"### {strategy}",
                         "",
                         f"- LLM calls: `{data.get('llm_calls_total')}` total (`{data.get('llm_calls_step5')}` Step 5, `{data.get('llm_calls_step6')}` Step 6)",
+                        f"- Proposition cache: `{data.get('proposition_cache_hits', 0)}` hits, `{data.get('proposition_cache_misses', 0)}` misses",
                         f"- Elapsed: `{data.get('step5_elapsed_seconds')}`s Step 5, `{data.get('step6_elapsed_seconds')}`s Step 6",
                         f"- Step 5 chunks: `{step5.get('chunks')}` avg elements `{step5.get('avg_elements_per_chunk')}` singletons `{step5.get('singletons')}`",
                         f"- Step 6 chunks: `{step6.get('chunks')}` avg elements `{step6.get('avg_elements_per_chunk')}` singletons `{step6.get('singletons')}`",
                         f"- Step 6 risk flags: `{step6.get('risk_flags')}`",
                         f"- Repair actions: `{data.get('repair_actions')}`",
+                        "",
+                    ]
+                )
+    return "\n".join(lines)
+
+
+def render_qualitative_review_template(summary: dict[str, object]) -> str:
+    lines = [
+        "# Qualitative Chunk Review",
+        "",
+        "Use this review as the primary quality read. Metrics are supporting evidence, not the verdict.",
+        "",
+    ]
+    documents = summary.get("documents", {})
+    if isinstance(documents, dict):
+        for doc_key, strategies in documents.items():
+            if not isinstance(strategies, dict):
+                continue
+            lines.extend([f"## {doc_key}", ""])
+            for strategy in strategies:
+                lines.extend(
+                    [
+                        f"### {strategy}",
+                        "",
+                        "- Coherence:",
+                        "- Atomicity:",
+                        "- Self-containment:",
+                        "- Source fidelity:",
+                        "- Support/figure attachment:",
+                        "- Over-splitting:",
+                        "- Under-splitting:",
+                        "- Latency/cost notes:",
+                        "- Verdict:",
                         "",
                     ]
                 )

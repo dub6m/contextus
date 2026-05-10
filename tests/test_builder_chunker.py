@@ -375,6 +375,113 @@ def test_semantic_walk_refinement_keeps_small_blocks_unsplit():
     assert chunker.llm_calls == 0
 
 
+def test_proposition_response_parser_accepts_array_and_empty_propositions():
+    chunker = make_chunker()
+
+    parsed = chunker._parse_proposition_response(
+        '[{"element_id":"a","propositions":["Alpha setup."],"ignored":true},'
+        '{"element_id":"b","propositions":[]}]'
+    )
+
+    assert parsed == {"a": ["Alpha setup."], "b": []}
+    assert chunker._parse_proposition_response("not json") is None
+
+
+def test_proposition_walk_uses_cache_for_repeated_block_generation():
+    llm = QueueLLM(
+        '{"elements":['
+        '{"element_id":"block-a-0","propositions":["Alpha setup."]},'
+        '{"element_id":"block-a-1","propositions":["Alpha detail."]}'
+        ']}'
+    )
+    chunker = make_chunker(llm_client=llm)
+    block = make_block_with_texts("block-a", ["Alpha setup.", "Alpha detail."])
+
+    first = chunker._proposition_texts_for_block(block)
+    second = chunker._proposition_texts_for_block(block)
+
+    assert first == ["Alpha setup.", "Alpha detail."]
+    assert second == first
+    assert chunker.llm_calls == 1
+    assert chunker.proposition_cache_misses == 2
+    assert chunker.proposition_cache_hits == 2
+
+
+def test_proposition_walk_splits_on_proposition_embeddings_but_returns_original_elements():
+    llm = QueueLLM(
+        '{"elements":['
+        '{"element_id":"a","propositions":["Alpha setup."]},'
+        '{"element_id":"b","propositions":["Alpha detail."]},'
+        '{"element_id":"c","propositions":["Alpha conclusion."]},'
+        '{"element_id":"d","propositions":["Beta setup."]},'
+        '{"element_id":"e","propositions":["Beta detail."]}'
+        ']}'
+    )
+    elements = [
+        make_element("text", 1, id="a", content="This begins it."),
+        make_element("text", 2, id="b", content="It continues."),
+        make_element("text", 3, id="c", content="This concludes it."),
+        make_element("text", 4, id="d", content="A new topic starts."),
+        make_element("text", 5, id="e", content="The new topic continues."),
+    ]
+    config = BuilderConfig(
+        SEMANTIC_WALK_BUFFER_SIZE=0,
+        SEMANTIC_WALK_BREAKPOINT_PERCENTILE=75,
+        SEMANTIC_WALK_MIN_BOUNDARIES=2,
+    )
+    chunker = make_chunker(llm_client=llm, config=config, type_priors={("text", "text"): 0.5})
+    chunker._compute_similarity_stats = lambda texts: ([0.5] * 4, 0.5, 0.0)
+    chunker._embed_texts = lambda texts: __import__("numpy").array([
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+    ])
+
+    groups = chunker.build_refined_groups(
+        make_document(elements),
+        allow_llm=True,
+        refinement_strategy="proposition_walk",
+    )
+
+    assert [group.element_ids for group in groups] == [["a", "b", "c"], ["d", "e"]]
+    assert [element.text for element in groups[0].elements] == [
+        "This begins it.",
+        "It continues.",
+        "This concludes it.",
+    ]
+    assert {group.search_strategy for group in groups} == {"proposition_walk"}
+    assert chunker.llm_calls == 1
+
+
+def test_proposition_walk_respects_allow_llm_false_with_semantic_walk_fallback():
+    elements = [
+        make_element("text", 1, id="a", content="Alpha setup."),
+        make_element("text", 2, id="b", content="Alpha detail."),
+        make_element("text", 3, id="c", content="Beta setup."),
+    ]
+    config = BuilderConfig(SEMANTIC_WALK_BREAKPOINT_PERCENTILE=50, SEMANTIC_WALK_MIN_BOUNDARIES=1)
+    chunker = make_chunker(llm_client=DummyLLM(), config=config, type_priors={("text", "text"): 0.5})
+    chunker._compute_similarity_stats = lambda texts: ([0.5, 0.5], 0.5, 0.0)
+    chunker._embed_texts = lambda texts: __import__("numpy").array([
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ])
+
+    groups = chunker.build_refined_groups(
+        make_document(elements),
+        allow_llm=False,
+        refinement_strategy="proposition_walk",
+    )
+
+    assert [group.element_ids for group in groups] == [["a", "b"], ["c"]]
+    assert {group.search_strategy for group in groups} == {"semantic_walk"}
+    assert chunker.llm_calls == 0
+    assert "LLM refinement is disabled" in chunker.recoverable_errors[0]
+
+
 def test_local_audit_audits_non_overlapping_suspicious_chunks_concurrently():
     llm = SlowAuditLLM(delay=0.15)
     chunker = make_chunker(llm_client=llm)
