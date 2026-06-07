@@ -119,10 +119,14 @@ FrameSlot
   name
   value
   term_id
-  state: filled | missing | ambiguous | resolved
+  fill_state: filled | missing | ambiguous
+  grounding_state: unneeded | self_asserted | grounded | unsupported
   source_span
   evidence_refs
 ```
+
+This separation matters. A slot can be filled because extraction found a value,
+but still unsupported because no acceptable document evidence grounds that value.
 
 Predicates should stay open and document-derived. The resolver may later attach
 optional families for convenience, but it must not require a complete predicate
@@ -136,7 +140,7 @@ Needs are created from:
 
 - missing frame slots
 - ambiguous frame slots
-- filled slots with no acceptable grounding evidence
+- filled slots whose `grounding_state` is `unsupported`
 - unsupported constraints
 - unsupported links between facts
 
@@ -281,6 +285,8 @@ Link closure:
 - explicit discourse edges, source paths, formulas, and NLI can help identify
   candidates
 - final closure still requires a traceable source-backed link
+- complex link closure is not part of the first slice unless the link is
+  directly explicit in the source structure
 
 Cycle handling:
 
