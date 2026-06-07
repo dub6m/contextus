@@ -215,3 +215,14 @@ def test_document_term_index_records_mentions_with_source():
     assert strip.canonical == "vertical strip"
     assert strip.mentions[0].element_id == "e1"
     assert strip.mentions[0].source_signal == "nounish_span"
+
+
+def test_document_term_index_does_not_cross_verbs_or_stopwords():
+    index = DocumentTermIndex.from_texts([("e1", "The median line splits the points.")])
+
+    assert "term:median_line" in index.terms
+    assert "term:line" in index.terms
+    assert "term:line_split" not in index.terms
+    assert "term:median_line_split" not in index.terms
+    assert "term:split_the" not in index.terms
+    assert "term:split_the_point" not in index.terms

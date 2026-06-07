@@ -29,6 +29,16 @@ _STOP_TERMS = {
     "to",
     "with",
 }
+_TERM_BREAKERS = _STOP_TERMS | {
+    "contain",
+    "contains",
+    "draw",
+    "drawn",
+    "has",
+    "have",
+    "split",
+    "splits",
+}
 
 
 @dataclass(frozen=True)
@@ -72,16 +82,25 @@ def _candidate_term_spans(text: str) -> list[tuple[str, int, int, str]]:
         spans.append((match.group(0), match.start(), match.end(), "symbol"))
 
     tokens = list(_TERM_TOKEN_RE.finditer(text or ""))
-    for width in (3, 2, 1):
-        for index in range(0, max(0, len(tokens) - width + 1)):
-            group = tokens[index : index + width]
+    run: list[re.Match[str]] = []
+    for token in tokens:
+        if token.group(0).lower() in _TERM_BREAKERS:
+            spans.extend(_spans_from_token_run(run))
+            run = []
+            continue
+        run.append(token)
+    spans.extend(_spans_from_token_run(run))
+    return spans
+
+
+def _spans_from_token_run(run: list[re.Match[str]]) -> list[tuple[str, int, int, str]]:
+    spans: list[tuple[str, int, int, str]] = []
+    for width in (2, 1):
+        for index in range(0, max(0, len(run) - width + 1)):
+            group = run[index : index + width]
             words = [item.group(0) for item in group]
             lowered = [word.lower() for word in words]
-            if all(word in _STOP_TERMS for word in lowered):
-                continue
-            if lowered[0] in _STOP_TERMS and width == 1:
-                continue
-            if width > 1 and any(word in {"and", "or", "but"} for word in lowered):
+            if any(word in _STOP_TERMS or word in _TERM_BREAKERS for word in lowered):
                 continue
             spans.append((" ".join(words), group[0].start(), group[-1].end(), "nounish_span"))
     return spans
