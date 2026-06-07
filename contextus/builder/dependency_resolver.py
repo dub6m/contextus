@@ -9,6 +9,7 @@ from typing import Mapping
 _TERM_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _SYMBOL_RE = re.compile(r"\b[A-Za-z]+_[A-Za-z0-9]+\b")
 _ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
+_TERM_SEGMENT_RE = re.compile(r"[^.,;:()\[\]{}]+")
 _STOP_TERMS = {
     "a",
     "an",
@@ -81,10 +82,10 @@ def normalize_term_text(text: str) -> str:
 def _singularize_term_token(token: str) -> str:
     if len(token) <= 3 or token.endswith(_SINGULAR_S_ENDINGS):
         return token
+    if token.endswith("series"):
+        return token
     if token.endswith("ies") and len(token) > 4:
         return token[:-3] + "y"
-    if token.endswith("es") and len(token) > 4:
-        return token[:-2]
     if token.endswith("s"):
         return token[:-1]
     return token
@@ -112,19 +113,26 @@ def _candidate_term_spans(text: str) -> list[tuple[str, int, int, str]]:
     for match in _SYMBOL_RE.finditer(text or ""):
         spans.append((match.group(0), match.start(), match.end(), "symbol"))
 
-    tokens = list(_TERM_TOKEN_RE.finditer(text or ""))
-    run: list[re.Match[str]] = []
-    for token in tokens:
-        if _looks_like_term_breaker(token.group(0)):
-            spans.extend(_spans_from_token_run(run))
-            run = []
-            continue
-        run.append(token)
-    spans.extend(_spans_from_token_run(run))
+    for segment in _TERM_SEGMENT_RE.finditer(text or ""):
+        spans.extend(_candidate_term_spans_in_segment(segment.group(0), segment.start()))
     return spans
 
 
-def _spans_from_token_run(run: list[re.Match[str]]) -> list[tuple[str, int, int, str]]:
+def _candidate_term_spans_in_segment(segment: str, offset: int) -> list[tuple[str, int, int, str]]:
+    spans: list[tuple[str, int, int, str]] = []
+    tokens = list(_TERM_TOKEN_RE.finditer(segment))
+    run: list[re.Match[str]] = []
+    for token in tokens:
+        if _looks_like_term_breaker(token.group(0)):
+            spans.extend(_spans_from_token_run(run, offset))
+            run = []
+            continue
+        run.append(token)
+    spans.extend(_spans_from_token_run(run, offset))
+    return spans
+
+
+def _spans_from_token_run(run: list[re.Match[str]], offset: int = 0) -> list[tuple[str, int, int, str]]:
     spans: list[tuple[str, int, int, str]] = []
     for width in (2, 1):
         for index in range(0, max(0, len(run) - width + 1)):
@@ -133,14 +141,18 @@ def _spans_from_token_run(run: list[re.Match[str]]) -> list[tuple[str, int, int,
             lowered = [word.lower() for word in words]
             if any(_looks_like_term_breaker(word) for word in lowered):
                 continue
-            spans.append((" ".join(words), group[0].start(), group[-1].end(), "nounish_span"))
+            spans.append((" ".join(words), offset + group[0].start(), offset + group[-1].end(), "nounish_span"))
     return spans
 
 
 @dataclass(frozen=True)
 class DocumentTermIndex:
-    terms: dict[str, DocumentTerm]
-    mentions_by_element_id: dict[str, tuple[TermMention, ...]]
+    terms: Mapping[str, DocumentTerm]
+    mentions_by_element_id: Mapping[str, tuple[TermMention, ...]]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "terms", MappingProxyType(dict(self.terms)))
+        object.__setattr__(self, "mentions_by_element_id", MappingProxyType(dict(self.mentions_by_element_id)))
 
     @classmethod
     def from_texts(cls, texts: list[tuple[str, str]]) -> "DocumentTermIndex":

@@ -202,6 +202,13 @@ def test_normalize_term_text_preserves_singular_s_endings():
     assert normalize_term_text("points") == "point"
 
 
+def test_normalize_term_text_does_not_corrupt_common_s_endings():
+    assert normalize_term_text("lines") == "line"
+    assert normalize_term_text("sides") == "side"
+    assert normalize_term_text("series") == "series"
+    assert normalize_term_text("axis") == "axis"
+
+
 def test_document_term_index_keeps_specific_terms_separate():
     index = DocumentTermIndex.from_texts(
         [
@@ -245,3 +252,21 @@ def test_document_term_index_does_not_cross_intersect_verb():
     assert "term:x_axis_intersect" not in index.terms
     assert "term:intersect_the" not in index.terms
     assert "term:intersect_the_y" not in index.terms
+
+
+def test_document_term_index_does_not_cross_punctuation_boundaries():
+    index = DocumentTermIndex.from_texts([("e1", "Line. Median line.")])
+
+    assert "term:line" in index.terms
+    assert "term:median_line" in index.terms
+    assert "term:line_median" not in index.terms
+
+
+def test_document_term_index_mappings_are_immutable():
+    index = DocumentTermIndex.from_texts([("e1", "The median line.")])
+
+    with pytest.raises(TypeError):
+        index.terms["term:x"] = index.terms["term:median_line"]
+
+    with pytest.raises(TypeError):
+        index.mentions_by_element_id["e2"] = ()
