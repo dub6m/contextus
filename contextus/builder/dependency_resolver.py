@@ -39,6 +39,13 @@ _TERM_BREAKERS = _STOP_TERMS | {
     "split",
     "splits",
 }
+_SINGULAR_S_ENDINGS = ("is", "sis", "us", "ias", "ss")
+_VERBISH_STEMS = {
+    "contain",
+    "draw",
+    "intersect",
+    "split",
+}
 
 
 @dataclass(frozen=True)
@@ -66,14 +73,38 @@ def normalize_term_text(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
     parts = []
     for token in cleaned.split(" "):
-        if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
-            token = token[:-1]
+        token = _singularize_term_token(token)
         parts.append(token)
     return " ".join(parts)
 
 
+def _singularize_term_token(token: str) -> str:
+    if len(token) <= 3 or token.endswith(_SINGULAR_S_ENDINGS):
+        return token
+    if token.endswith("ies") and len(token) > 4:
+        return token[:-3] + "y"
+    if token.endswith("es") and len(token) > 4:
+        return token[:-2]
+    if token.endswith("s"):
+        return token[:-1]
+    return token
+
+
 def _term_id(normalized: str) -> str:
     return "term:" + re.sub(r"[^a-z0-9_]+", "_", normalized).strip("_")
+
+
+def _looks_like_term_breaker(token: str) -> bool:
+    lowered = token.lower()
+    if lowered in _TERM_BREAKERS:
+        return True
+    if lowered.endswith("s") and lowered[:-1] in _VERBISH_STEMS:
+        return True
+    if lowered.endswith("ed") and lowered[:-2] in _VERBISH_STEMS:
+        return True
+    if lowered.endswith("ing") and lowered[:-3] in _VERBISH_STEMS:
+        return True
+    return False
 
 
 def _candidate_term_spans(text: str) -> list[tuple[str, int, int, str]]:
@@ -84,7 +115,7 @@ def _candidate_term_spans(text: str) -> list[tuple[str, int, int, str]]:
     tokens = list(_TERM_TOKEN_RE.finditer(text or ""))
     run: list[re.Match[str]] = []
     for token in tokens:
-        if token.group(0).lower() in _TERM_BREAKERS:
+        if _looks_like_term_breaker(token.group(0)):
             spans.extend(_spans_from_token_run(run))
             run = []
             continue
@@ -100,7 +131,7 @@ def _spans_from_token_run(run: list[re.Match[str]]) -> list[tuple[str, int, int,
             group = run[index : index + width]
             words = [item.group(0) for item in group]
             lowered = [word.lower() for word in words]
-            if any(word in _STOP_TERMS or word in _TERM_BREAKERS for word in lowered):
+            if any(_looks_like_term_breaker(word) for word in lowered):
                 continue
             spans.append((" ".join(words), group[0].start(), group[-1].end(), "nounish_span"))
     return spans

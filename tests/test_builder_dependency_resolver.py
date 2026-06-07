@@ -194,6 +194,14 @@ def test_normalize_term_text_is_conservative():
     assert normalize_term_text("Q_x") == "q_x"
 
 
+def test_normalize_term_text_preserves_singular_s_endings():
+    assert normalize_term_text("axis") == "axis"
+    assert normalize_term_text("bias") == "bias"
+    assert normalize_term_text("analysis") == "analysis"
+    assert normalize_term_text("status") == "status"
+    assert normalize_term_text("points") == "point"
+
+
 def test_document_term_index_keeps_specific_terms_separate():
     index = DocumentTermIndex.from_texts(
         [
@@ -226,3 +234,14 @@ def test_document_term_index_does_not_cross_verbs_or_stopwords():
     assert "term:median_line_split" not in index.terms
     assert "term:split_the" not in index.terms
     assert "term:split_the_point" not in index.terms
+
+
+def test_document_term_index_does_not_cross_intersect_verb():
+    index = DocumentTermIndex.from_texts([("e1", "The x axis intersects the y axis.")])
+
+    assert "term:x_axis" in index.terms
+    assert "term:y_axis" in index.terms
+    assert "term:axis_intersect" not in index.terms
+    assert "term:x_axis_intersect" not in index.terms
+    assert "term:intersect_the" not in index.terms
+    assert "term:intersect_the_y" not in index.terms
