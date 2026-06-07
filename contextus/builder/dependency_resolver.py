@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Mapping
 
 
 @dataclass(frozen=True)
@@ -52,10 +54,13 @@ class FactFrame:
     frame_id: str
     source: SourceRef
     predicate: str
-    slots: dict[str, FrameSlot] = field(default_factory=dict)
+    slots: Mapping[str, FrameSlot] = field(default_factory=dict)
     constraints: tuple[FrameConstraint, ...] = ()
     links: tuple[str, ...] = ()
     extraction_status: str = "asserted"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "slots", MappingProxyType(dict(self.slots)))
 
 
 @dataclass(frozen=True)
@@ -71,16 +76,24 @@ class Need:
 @dataclass(frozen=True)
 class CandidateSupport:
     need_id: str
-    candidate_frame_ids: list[str]
-    matched_parts: list[str]
-    rejected_parts: list[str] = field(default_factory=list)
+    candidate_frame_ids: tuple[str, ...]
+    matched_parts: tuple[str, ...]
+    rejected_parts: tuple[str, ...] = ()
     status: str = "candidate"
     reason: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "candidate_frame_ids", tuple(self.candidate_frame_ids))
+        object.__setattr__(self, "matched_parts", tuple(self.matched_parts))
+        object.__setattr__(self, "rejected_parts", tuple(self.rejected_parts))
 
 
 @dataclass(frozen=True)
 class ResolutionTraceStep:
     action: str
     need_id: str = ""
-    frame_ids: list[str] = field(default_factory=list)
+    frame_ids: tuple[str, ...] = ()
     reason: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "frame_ids", tuple(self.frame_ids))
