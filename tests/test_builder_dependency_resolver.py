@@ -2,6 +2,8 @@ import pytest
 
 from contextus.builder.dependency_resolver import (
     CandidateSupport,
+    DocumentTermIndex,
+    normalize_term_text,
     FactFrame,
     FrameConstraint,
     FrameSlot,
@@ -182,3 +184,34 @@ def test_trace_step_converts_list_inputs_to_tuples():
     step = ResolutionTraceStep(action="need_resolved", frame_ids=["frame:e2:0"])
 
     assert step.frame_ids == ("frame:e2:0",)
+
+
+def test_normalize_term_text_is_conservative():
+    assert normalize_term_text("The strip.") == "strip"
+    assert normalize_term_text("candidate points") == "candidate point"
+    assert normalize_term_text("median line") == "median line"
+    assert normalize_term_text("line") == "line"
+    assert normalize_term_text("Q_x") == "q_x"
+
+
+def test_document_term_index_keeps_specific_terms_separate():
+    index = DocumentTermIndex.from_texts(
+        [
+            ("e1", "The median line splits the points."),
+            ("e2", "The line is drawn vertically."),
+        ]
+    )
+
+    assert "term:median_line" in index.terms
+    assert "term:line" in index.terms
+    assert index.terms["term:median_line"].canonical == "median line"
+    assert index.terms["term:line"].canonical == "line"
+
+
+def test_document_term_index_records_mentions_with_source():
+    index = DocumentTermIndex.from_texts([("e1", "The vertical strip contains candidate points.")])
+
+    strip = index.terms["term:vertical_strip"]
+    assert strip.canonical == "vertical strip"
+    assert strip.mentions[0].element_id == "e1"
+    assert strip.mentions[0].source_signal == "nounish_span"

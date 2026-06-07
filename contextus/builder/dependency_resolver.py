@@ -1,8 +1,143 @@
 from __future__ import annotations
 
+import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping
+
+_TERM_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_SYMBOL_RE = re.compile(r"\b[A-Za-z]+_[A-Za-z0-9]+\b")
+_ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
+_STOP_TERMS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+}
+
+
+@dataclass(frozen=True)
+class TermMention:
+    text: str
+    normalized: str
+    element_id: str
+    char_start: int
+    char_end: int
+    source_signal: str
+    head: str = ""
+    modifiers: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DocumentTerm:
+    term_id: str
+    canonical: str
+    mentions: tuple[TermMention, ...] = ()
+
+
+def normalize_term_text(text: str) -> str:
+    cleaned = (text or "").strip().strip(".,;:()[]{}")
+    cleaned = _ARTICLE_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
+    parts = []
+    for token in cleaned.split(" "):
+        if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+            token = token[:-1]
+        parts.append(token)
+    return " ".join(parts)
+
+
+def _term_id(normalized: str) -> str:
+    return "term:" + re.sub(r"[^a-z0-9_]+", "_", normalized).strip("_")
+
+
+def _candidate_term_spans(text: str) -> list[tuple[str, int, int, str]]:
+    spans: list[tuple[str, int, int, str]] = []
+    for match in _SYMBOL_RE.finditer(text or ""):
+        spans.append((match.group(0), match.start(), match.end(), "symbol"))
+
+    tokens = list(_TERM_TOKEN_RE.finditer(text or ""))
+    for width in (3, 2, 1):
+        for index in range(0, max(0, len(tokens) - width + 1)):
+            group = tokens[index : index + width]
+            words = [item.group(0) for item in group]
+            lowered = [word.lower() for word in words]
+            if all(word in _STOP_TERMS for word in lowered):
+                continue
+            if lowered[0] in _STOP_TERMS and width == 1:
+                continue
+            if width > 1 and any(word in {"and", "or", "but"} for word in lowered):
+                continue
+            spans.append((" ".join(words), group[0].start(), group[-1].end(), "nounish_span"))
+    return spans
+
+
+@dataclass(frozen=True)
+class DocumentTermIndex:
+    terms: dict[str, DocumentTerm]
+    mentions_by_element_id: dict[str, tuple[TermMention, ...]]
+
+    @classmethod
+    def from_texts(cls, texts: list[tuple[str, str]]) -> "DocumentTermIndex":
+        mentions_by_key: dict[str, list[TermMention]] = defaultdict(list)
+        mentions_by_element: dict[str, list[TermMention]] = defaultdict(list)
+        seen: set[tuple[str, str, int, int]] = set()
+
+        for element_id, text in texts:
+            for surface, start, end, source_signal in _candidate_term_spans(text):
+                normalized = normalize_term_text(surface)
+                if not normalized or normalized in _STOP_TERMS:
+                    continue
+                key = (element_id, normalized, start, end)
+                if key in seen:
+                    continue
+                seen.add(key)
+                words = normalized.split()
+                mention = TermMention(
+                    text=surface,
+                    normalized=normalized,
+                    element_id=element_id,
+                    char_start=start,
+                    char_end=end,
+                    source_signal=source_signal,
+                    head=words[-1] if words else "",
+                    modifiers=tuple(words[:-1]),
+                )
+                mentions_by_key[normalized].append(mention)
+                mentions_by_element[element_id].append(mention)
+
+        terms = {
+            _term_id(normalized): DocumentTerm(
+                term_id=_term_id(normalized),
+                canonical=normalized,
+                mentions=tuple(mentions),
+            )
+            for normalized, mentions in mentions_by_key.items()
+        }
+        return cls(
+            terms=terms,
+            mentions_by_element_id={key: tuple(value) for key, value in mentions_by_element.items()},
+        )
+
+    def term_id_for_text(self, text: str) -> str:
+        normalized = normalize_term_text(text)
+        term_id = _term_id(normalized)
+        return term_id if term_id in self.terms else ""
 
 
 @dataclass(frozen=True)
