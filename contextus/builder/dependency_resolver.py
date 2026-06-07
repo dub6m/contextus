@@ -9,7 +9,7 @@ from typing import Mapping
 _TERM_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _SYMBOL_RE = re.compile(r"\b[A-Za-z]+_[A-Za-z0-9]+\b")
 _ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
-_TERM_SEGMENT_RE = re.compile(r"[^.,;:()\[\]{}]+")
+_TERM_SEGMENT_RE = re.compile(r"[^.,;:()\[\]{}\-/+*=<>]+")
 _STOP_TERMS = {
     "a",
     "an",
@@ -40,7 +40,7 @@ _TERM_BREAKERS = _STOP_TERMS | {
     "split",
     "splits",
 }
-_SINGULAR_S_ENDINGS = ("is", "sis", "us", "ias", "ss")
+_SAFE_PLURAL_SUFFIXES = ("ates", "ides", "ines", "ints", "ows", "xes", "sses")
 _VERBISH_STEMS = {
     "contain",
     "draw",
@@ -60,12 +60,18 @@ class TermMention:
     head: str = ""
     modifiers: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "modifiers", tuple(self.modifiers))
+
 
 @dataclass(frozen=True)
 class DocumentTerm:
     term_id: str
     canonical: str
     mentions: tuple[TermMention, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mentions", tuple(self.mentions))
 
 
 def normalize_term_text(text: str) -> str:
@@ -80,13 +86,11 @@ def normalize_term_text(text: str) -> str:
 
 
 def _singularize_term_token(token: str) -> str:
-    if len(token) <= 3 or token.endswith(_SINGULAR_S_ENDINGS):
-        return token
-    if token.endswith("series"):
+    if token == "series":
         return token
     if token.endswith("ies") and len(token) > 4:
         return token[:-3] + "y"
-    if token.endswith("s"):
+    if token.endswith(_SAFE_PLURAL_SUFFIXES):
         return token[:-1]
     return token
 
@@ -113,26 +117,31 @@ def _candidate_term_spans(text: str) -> list[tuple[str, int, int, str]]:
     for match in _SYMBOL_RE.finditer(text or ""):
         spans.append((match.group(0), match.start(), match.end(), "symbol"))
 
-    for segment in _TERM_SEGMENT_RE.finditer(text or ""):
-        spans.extend(_candidate_term_spans_in_segment(segment.group(0), segment.start()))
+    source = text or ""
+    for segment in _TERM_SEGMENT_RE.finditer(source):
+        spans.extend(_candidate_term_spans_in_segment(source, segment.start(), segment.end()))
     return spans
 
 
-def _candidate_term_spans_in_segment(segment: str, offset: int) -> list[tuple[str, int, int, str]]:
+def _candidate_term_spans_in_segment(text: str, start: int, end: int) -> list[tuple[str, int, int, str]]:
     spans: list[tuple[str, int, int, str]] = []
+    segment = text[start:end]
     tokens = list(_TERM_TOKEN_RE.finditer(segment))
     run: list[re.Match[str]] = []
     for token in tokens:
         if _looks_like_term_breaker(token.group(0)):
-            spans.extend(_spans_from_token_run(run, offset))
+            spans.extend(_spans_from_token_run(text, run, start))
             run = []
             continue
+        if run and not segment[run[-1].end() : token.start()].isspace():
+            spans.extend(_spans_from_token_run(text, run, start))
+            run = []
         run.append(token)
-    spans.extend(_spans_from_token_run(run, offset))
+    spans.extend(_spans_from_token_run(text, run, start))
     return spans
 
 
-def _spans_from_token_run(run: list[re.Match[str]], offset: int = 0) -> list[tuple[str, int, int, str]]:
+def _spans_from_token_run(text: str, run: list[re.Match[str]], offset: int = 0) -> list[tuple[str, int, int, str]]:
     spans: list[tuple[str, int, int, str]] = []
     for width in (2, 1):
         for index in range(0, max(0, len(run) - width + 1)):
@@ -141,7 +150,9 @@ def _spans_from_token_run(run: list[re.Match[str]], offset: int = 0) -> list[tup
             lowered = [word.lower() for word in words]
             if any(_looks_like_term_breaker(word) for word in lowered):
                 continue
-            spans.append((" ".join(words), offset + group[0].start(), offset + group[-1].end(), "nounish_span"))
+            start = offset + group[0].start()
+            end = offset + group[-1].end()
+            spans.append((text[start:end], start, end, "nounish_span"))
     return spans
 
 
@@ -152,7 +163,8 @@ class DocumentTermIndex:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "terms", MappingProxyType(dict(self.terms)))
-        object.__setattr__(self, "mentions_by_element_id", MappingProxyType(dict(self.mentions_by_element_id)))
+        mentions_by_element = {key: tuple(value) for key, value in self.mentions_by_element_id.items()}
+        object.__setattr__(self, "mentions_by_element_id", MappingProxyType(mentions_by_element))
 
     @classmethod
     def from_texts(cls, texts: list[tuple[str, str]]) -> "DocumentTermIndex":
@@ -161,7 +173,8 @@ class DocumentTermIndex:
         seen: set[tuple[str, str, int, int]] = set()
 
         for element_id, text in texts:
-            for surface, start, end, source_signal in _candidate_term_spans(text):
+            source_text = text or ""
+            for surface, start, end, source_signal in _candidate_term_spans(source_text):
                 normalized = normalize_term_text(surface)
                 if not normalized or normalized in _STOP_TERMS:
                     continue
@@ -171,7 +184,7 @@ class DocumentTermIndex:
                 seen.add(key)
                 words = normalized.split()
                 mention = TermMention(
-                    text=surface,
+                    text=source_text[start:end],
                     normalized=normalized,
                     element_id=element_id,
                     char_start=start,

@@ -2,7 +2,9 @@ import pytest
 
 from contextus.builder.dependency_resolver import (
     CandidateSupport,
+    DocumentTerm,
     DocumentTermIndex,
+    TermMention,
     normalize_term_text,
     FactFrame,
     FrameConstraint,
@@ -209,6 +211,14 @@ def test_normalize_term_text_does_not_corrupt_common_s_endings():
     assert normalize_term_text("axis") == "axis"
 
 
+def test_normalize_term_text_avoids_risky_s_stripping():
+    assert normalize_term_text("lens") == "lens"
+    assert normalize_term_text("canvas") == "canvas"
+    assert normalize_term_text("chaos") == "chaos"
+    assert normalize_term_text("points") == "point"
+    assert normalize_term_text("candidates") == "candidate"
+
+
 def test_document_term_index_keeps_specific_terms_separate():
     index = DocumentTermIndex.from_texts(
         [
@@ -270,3 +280,40 @@ def test_document_term_index_mappings_are_immutable():
 
     with pytest.raises(TypeError):
         index.mentions_by_element_id["e2"] = ()
+
+
+def test_document_term_index_does_not_cross_dash_or_slash_boundaries():
+    index = DocumentTermIndex.from_texts([("e1", "Line - median line / candidate points")])
+
+    assert "term:line" in index.terms
+    assert "term:median_line" in index.terms
+    assert "term:candidate_point" in index.terms
+    assert "term:line_median" not in index.terms
+    assert "term:line_candidate" not in index.terms
+
+
+def test_term_mentions_preserve_exact_source_span_text():
+    text = "The vertical strip contains candidate points."
+    index = DocumentTermIndex.from_texts([("e1", text)])
+
+    for term in index.terms.values():
+        for mention in term.mentions:
+            assert mention.text == text[mention.char_start : mention.char_end]
+
+
+def test_term_models_normalize_nested_collections_from_direct_constructors():
+    mention = TermMention(
+        text="candidate points",
+        normalized="candidate point",
+        element_id="e1",
+        char_start=0,
+        char_end=16,
+        source_signal="nounish_span",
+        modifiers=["candidate"],
+    )
+    term = DocumentTerm(term_id="term:candidate_point", canonical="candidate point", mentions=[mention])
+    index = DocumentTermIndex(terms={"term:candidate_point": term}, mentions_by_element_id={"e1": [mention]})
+
+    assert mention.modifiers == ("candidate",)
+    assert term.mentions == (mention,)
+    assert index.mentions_by_element_id["e1"] == (mention,)
