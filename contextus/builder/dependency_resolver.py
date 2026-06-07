@@ -6,47 +6,16 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping
 
-_TERM_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _SYMBOL_RE = re.compile(r"\b[A-Za-z]+_[A-Za-z0-9]+\b")
-_ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
-_TERM_SEGMENT_RE = re.compile(r"[^.,;:()\[\]{}\-/+*=<>]+")
-_STOP_TERMS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "be",
-    "by",
-    "for",
-    "from",
-    "in",
-    "is",
-    "of",
-    "on",
-    "or",
-    "the",
-    "to",
-    "with",
-}
-_TERM_BREAKERS = _STOP_TERMS | {
-    "contain",
-    "contains",
-    "draw",
-    "drawn",
-    "has",
-    "have",
-    "split",
-    "splits",
-}
-_SAFE_PLURAL_SUFFIXES = ("ates", "ides", "ines", "ints", "ows", "xes", "sses")
-_VERBISH_STEMS = {
-    "contain",
-    "draw",
-    "intersect",
-    "split",
-}
+
+
+@dataclass(frozen=True)
+class TermCandidate:
+    element_id: str
+    text: str
+    char_start: int
+    char_end: int
+    source_signal: str
 
 
 @dataclass(frozen=True)
@@ -76,84 +45,26 @@ class DocumentTerm:
 
 def normalize_term_text(text: str) -> str:
     cleaned = (text or "").strip().strip(".,;:()[]{}")
-    cleaned = _ARTICLE_RE.sub("", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
-    parts = []
-    for token in cleaned.split(" "):
-        token = _singularize_term_token(token)
-        parts.append(token)
-    return " ".join(parts)
-
-
-def _singularize_term_token(token: str) -> str:
-    if token == "series":
-        return token
-    if token.endswith("ies") and len(token) > 4:
-        return token[:-3] + "y"
-    if token.endswith(_SAFE_PLURAL_SUFFIXES):
-        return token[:-1]
-    return token
+    return re.sub(r"\s+", " ", cleaned).strip().lower()
 
 
 def _term_id(normalized: str) -> str:
     return "term:" + re.sub(r"[^a-z0-9_]+", "_", normalized).strip("_")
 
 
-def _looks_like_term_breaker(token: str) -> bool:
-    lowered = token.lower()
-    if lowered in _TERM_BREAKERS:
-        return True
-    if lowered.endswith("s") and lowered[:-1] in _VERBISH_STEMS:
-        return True
-    if lowered.endswith("ed") and lowered[:-2] in _VERBISH_STEMS:
-        return True
-    if lowered.endswith("ing") and lowered[:-3] in _VERBISH_STEMS:
-        return True
-    return False
-
-
-def _candidate_term_spans(text: str) -> list[tuple[str, int, int, str]]:
-    spans: list[tuple[str, int, int, str]] = []
+def _symbol_term_candidates(element_id: str, text: str) -> list[TermCandidate]:
+    candidates: list[TermCandidate] = []
     for match in _SYMBOL_RE.finditer(text or ""):
-        spans.append((match.group(0), match.start(), match.end(), "symbol"))
-
-    source = text or ""
-    for segment in _TERM_SEGMENT_RE.finditer(source):
-        spans.extend(_candidate_term_spans_in_segment(source, segment.start(), segment.end()))
-    return spans
-
-
-def _candidate_term_spans_in_segment(text: str, start: int, end: int) -> list[tuple[str, int, int, str]]:
-    spans: list[tuple[str, int, int, str]] = []
-    segment = text[start:end]
-    tokens = list(_TERM_TOKEN_RE.finditer(segment))
-    run: list[re.Match[str]] = []
-    for token in tokens:
-        if _looks_like_term_breaker(token.group(0)):
-            spans.extend(_spans_from_token_run(text, run, start))
-            run = []
-            continue
-        if run and not segment[run[-1].end() : token.start()].isspace():
-            spans.extend(_spans_from_token_run(text, run, start))
-            run = []
-        run.append(token)
-    spans.extend(_spans_from_token_run(text, run, start))
-    return spans
-
-
-def _spans_from_token_run(text: str, run: list[re.Match[str]], offset: int = 0) -> list[tuple[str, int, int, str]]:
-    spans: list[tuple[str, int, int, str]] = []
-    for width in (2, 1):
-        for index in range(0, max(0, len(run) - width + 1)):
-            group = run[index : index + width]
-            words = [item.group(0) for item in group]
-            lowered = [word.lower() for word in words]
-            if any(_looks_like_term_breaker(word) for word in lowered):
-                continue
-            start = offset + group[0].start()
-            end = offset + group[-1].end()
-            spans.append((text[start:end], start, end, "nounish_span"))
-    return spans
+        candidates.append(
+            TermCandidate(
+                element_id=element_id,
+                text=match.group(0),
+                char_start=match.start(),
+                char_end=match.end(),
+                source_signal="symbol",
+            )
+        )
+    return candidates
 
 
 @dataclass(frozen=True)
@@ -168,33 +79,38 @@ class DocumentTermIndex:
 
     @classmethod
     def from_texts(cls, texts: list[tuple[str, str]]) -> "DocumentTermIndex":
+        candidates: list[TermCandidate] = []
+        for element_id, text in texts:
+            candidates.extend(_symbol_term_candidates(element_id, text or ""))
+        return cls.from_candidates(candidates)
+
+    @classmethod
+    def from_candidates(cls, candidates: list[TermCandidate]) -> "DocumentTermIndex":
         mentions_by_key: dict[str, list[TermMention]] = defaultdict(list)
         mentions_by_element: dict[str, list[TermMention]] = defaultdict(list)
         seen: set[tuple[str, str, int, int]] = set()
 
-        for element_id, text in texts:
-            source_text = text or ""
-            for surface, start, end, source_signal in _candidate_term_spans(source_text):
-                normalized = normalize_term_text(surface)
-                if not normalized or normalized in _STOP_TERMS:
-                    continue
-                key = (element_id, normalized, start, end)
-                if key in seen:
-                    continue
-                seen.add(key)
-                words = normalized.split()
-                mention = TermMention(
-                    text=source_text[start:end],
-                    normalized=normalized,
-                    element_id=element_id,
-                    char_start=start,
-                    char_end=end,
-                    source_signal=source_signal,
-                    head=words[-1] if words else "",
-                    modifiers=tuple(words[:-1]),
-                )
-                mentions_by_key[normalized].append(mention)
-                mentions_by_element[element_id].append(mention)
+        for candidate in candidates:
+            normalized = normalize_term_text(candidate.text)
+            if not normalized:
+                continue
+            key = (candidate.element_id, normalized, candidate.char_start, candidate.char_end)
+            if key in seen:
+                continue
+            seen.add(key)
+            words = normalized.split()
+            mention = TermMention(
+                text=candidate.text,
+                normalized=normalized,
+                element_id=candidate.element_id,
+                char_start=candidate.char_start,
+                char_end=candidate.char_end,
+                source_signal=candidate.source_signal,
+                head=words[-1] if words else "",
+                modifiers=tuple(words[:-1]),
+            )
+            mentions_by_key[normalized].append(mention)
+            mentions_by_element[candidate.element_id].append(mention)
 
         terms = {
             _term_id(normalized): DocumentTerm(

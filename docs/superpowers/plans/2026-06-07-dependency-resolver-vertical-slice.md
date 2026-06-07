@@ -4,20 +4,22 @@
 
 **Goal:** Build the first working dependency-resolver slice: structured facts, needs, candidate support, simple closure, and trace output.
 
-**Architecture:** Add one focused builder module that runs in parallel to the current query-time assembler. The first slice uses deterministic term/frame extraction and strict closure for simple term and quantity support. It does not replace planner, traversal, ranking, or answer bundle code.
+**Architecture:** Add one focused builder module that runs in parallel to the current query-time assembler. The first slice uses deterministic indexing and strict closure for simple term and quantity support. It does not replace planner, traversal, ranking, or answer bundle code.
 
-**Tech Stack:** Python dataclasses, regex helpers, existing `QueryEvidenceProposition` records, pytest.
+**Correction after Task 2 review:** Do not implement linguistic meaning extraction with finite word lists. No stop-word lists, verb lists, predicate synonym lists, discourse-marker lists, or morphology allow/deny lists should be added to resolver core unless the user explicitly approves that exact bounded use. Term indexing consumes extractor-provided `TermCandidate` spans. Phrase spotting and frame extraction must come from syntax/language-unit/frame candidates, not raw-text n-gram guessing.
+
+**Tech Stack:** Python dataclasses, structural symbol parsing, existing `QueryEvidenceProposition` records, pytest.
 
 ---
 
 ## File Structure
 
 - Create: `contextus/builder/dependency_resolver.py`
-  - Owns resolver data models, term extraction, simple frame extraction, need creation, candidate search, closure, and trace output for the first slice.
+  - Owns resolver data models, term indexing, frame data contracts, need creation, candidate search, closure, and trace output for the first slice.
 - Modify: `contextus/builder/__init__.py`
   - Exposes the new public classes for tests and future query-time integration.
 - Create: `tests/test_builder_dependency_resolver.py`
-  - Covers normalization, frame extraction, need creation, quantity closure, cycle recording, and package trace behavior.
+  - Covers normalization, term indexing, frame contracts, need creation, quantity closure, cycle recording, and package trace behavior.
 
 This first slice stays in one new module because it is experimental and small. Split it only after the data model stabilizes.
 
@@ -238,7 +240,7 @@ git commit -m "Add dependency resolver data models"
 
 ---
 
-### Task 2: Add Conservative Term Extraction
+### Task 2: Add Document Term Index
 
 **Files:**
 - Modify: `contextus/builder/dependency_resolver.py`
@@ -249,22 +251,35 @@ git commit -m "Add dependency resolver data models"
 Append these tests:
 
 ```python
-from contextus.builder.dependency_resolver import DocumentTermIndex, normalize_term_text
+from contextus.builder.dependency_resolver import DocumentTermIndex, TermCandidate, normalize_term_text
+
+
+def _term_candidate(element_id: str, source_text: str, term_text: str) -> TermCandidate:
+    start = source_text.index(term_text)
+    return TermCandidate(
+        element_id=element_id,
+        text=term_text,
+        char_start=start,
+        char_end=start + len(term_text),
+        source_signal="syntax_noun_chunk",
+    )
 
 
 def test_normalize_term_text_is_conservative():
-    assert normalize_term_text("The strip.") == "strip"
-    assert normalize_term_text("candidate points") == "candidate point"
+    assert normalize_term_text(" Strip. ") == "strip"
+    assert normalize_term_text("candidate points") == "candidate points"
     assert normalize_term_text("median line") == "median line"
     assert normalize_term_text("line") == "line"
     assert normalize_term_text("Q_x") == "q_x"
 
 
 def test_document_term_index_keeps_specific_terms_separate():
-    index = DocumentTermIndex.from_texts(
+    text1 = "The median line splits the points."
+    text2 = "The line is drawn vertically."
+    index = DocumentTermIndex.from_candidates(
         [
-            ("e1", "The median line splits the points."),
-            ("e2", "The line is drawn vertically."),
+            _term_candidate("e1", text1, "median line"),
+            _term_candidate("e2", text2, "line"),
         ]
     )
 
@@ -275,12 +290,19 @@ def test_document_term_index_keeps_specific_terms_separate():
 
 
 def test_document_term_index_records_mentions_with_source():
-    index = DocumentTermIndex.from_texts([("e1", "The vertical strip contains candidate points.")])
+    text = "The vertical strip contains candidate points."
+    index = DocumentTermIndex.from_candidates([_term_candidate("e1", text, "vertical strip")])
 
     strip = index.terms["term:vertical_strip"]
     assert strip.canonical == "vertical strip"
     assert strip.mentions[0].element_id == "e1"
-    assert strip.mentions[0].source_signal == "nounish_span"
+    assert strip.mentions[0].source_signal == "syntax_noun_chunk"
+
+
+def test_document_term_index_from_texts_only_extracts_structural_symbols():
+    index = DocumentTermIndex.from_texts([("e1", "The median line splits the points near Q_x.")])
+
+    assert list(index.terms) == ["term:q_x"]
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -293,148 +315,17 @@ Run:
 
 Expected: import failure for `DocumentTermIndex` and `normalize_term_text`.
 
-- [ ] **Step 3: Add term dataclasses and extraction helpers**
+- [ ] **Step 3: Add term dataclasses and indexing helpers**
 
-Append this code to `contextus/builder/dependency_resolver.py`:
+Implement the term index around extractor-provided spans:
 
-```python
-import re
-from collections import defaultdict
+- `TermCandidate`: `element_id`, exact `text`, `char_start`, `char_end`, and `source_signal`.
+- `TermMention`: normalized text plus exact provenance.
+- `DocumentTermIndex.from_candidates(candidates)`: normalizes supplied spans, deduplicates exact mentions, stores `DocumentTerm`s, and fills `mentions_by_element_id`.
+- `DocumentTermIndex.from_texts(texts)`: extracts only structural symbols such as `Q_x`; it must not guess phrase terms from raw text.
+- `normalize_term_text(text)`: trim edge punctuation, collapse whitespace, lowercase. Do not strip articles or singularize words with hand-written word/suffix lists.
 
-
-_TERM_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
-_SYMBOL_RE = re.compile(r"\b[A-Za-z]+_[A-Za-z0-9]+\b")
-_ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
-_STOP_TERMS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "be",
-    "by",
-    "for",
-    "from",
-    "in",
-    "is",
-    "of",
-    "on",
-    "or",
-    "the",
-    "to",
-    "with",
-}
-
-
-@dataclass(frozen=True)
-class TermMention:
-    text: str
-    normalized: str
-    element_id: str
-    char_start: int
-    char_end: int
-    source_signal: str
-    head: str = ""
-    modifiers: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class DocumentTerm:
-    term_id: str
-    canonical: str
-    mentions: tuple[TermMention, ...] = ()
-
-
-def normalize_term_text(text: str) -> str:
-    cleaned = (text or "").strip().strip(".,;:()[]{}")
-    cleaned = _ARTICLE_RE.sub("", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
-    parts = []
-    for token in cleaned.split(" "):
-        if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
-            token = token[:-1]
-        parts.append(token)
-    return " ".join(parts)
-
-
-def _term_id(normalized: str) -> str:
-    return "term:" + re.sub(r"[^a-z0-9_]+", "_", normalized).strip("_")
-
-
-def _candidate_term_spans(text: str) -> list[tuple[str, int, int, str]]:
-    spans: list[tuple[str, int, int, str]] = []
-    for match in _SYMBOL_RE.finditer(text or ""):
-        spans.append((match.group(0), match.start(), match.end(), "symbol"))
-
-    tokens = list(_TERM_TOKEN_RE.finditer(text or ""))
-    for width in (3, 2, 1):
-        for index in range(0, max(0, len(tokens) - width + 1)):
-            group = tokens[index : index + width]
-            words = [item.group(0) for item in group]
-            lowered = [word.lower() for word in words]
-            if all(word in _STOP_TERMS for word in lowered):
-                continue
-            if lowered[0] in _STOP_TERMS and width == 1:
-                continue
-            if width > 1 and any(word in {"and", "or", "but"} for word in lowered):
-                continue
-            spans.append((" ".join(words), group[0].start(), group[-1].end(), "nounish_span"))
-    return spans
-
-
-@dataclass(frozen=True)
-class DocumentTermIndex:
-    terms: dict[str, DocumentTerm]
-    mentions_by_element_id: dict[str, tuple[TermMention, ...]]
-
-    @classmethod
-    def from_texts(cls, texts: list[tuple[str, str]]) -> "DocumentTermIndex":
-        mentions_by_key: dict[str, list[TermMention]] = defaultdict(list)
-        mentions_by_element: dict[str, list[TermMention]] = defaultdict(list)
-        seen: set[tuple[str, str, int, int]] = set()
-
-        for element_id, text in texts:
-            for surface, start, end, source_signal in _candidate_term_spans(text):
-                normalized = normalize_term_text(surface)
-                if not normalized or normalized in _STOP_TERMS:
-                    continue
-                key = (element_id, normalized, start, end)
-                if key in seen:
-                    continue
-                seen.add(key)
-                words = normalized.split()
-                mention = TermMention(
-                    text=surface,
-                    normalized=normalized,
-                    element_id=element_id,
-                    char_start=start,
-                    char_end=end,
-                    source_signal=source_signal,
-                    head=words[-1] if words else "",
-                    modifiers=tuple(words[:-1]),
-                )
-                mentions_by_key[normalized].append(mention)
-                mentions_by_element[element_id].append(mention)
-
-        terms = {
-            _term_id(normalized): DocumentTerm(
-                term_id=_term_id(normalized),
-                canonical=normalized,
-                mentions=tuple(mentions),
-            )
-            for normalized, mentions in mentions_by_key.items()
-        }
-        return cls(
-            terms=terms,
-            mentions_by_element_id={key: tuple(value) for key, value in mentions_by_element.items()},
-        )
-
-    def term_id_for_text(self, text: str) -> str:
-        normalized = normalize_term_text(text)
-        term_id = _term_id(normalized)
-        return term_id if term_id in self.terms else ""
-```
+Do not add stop-word lists, verb lists, discourse-marker lists, or morphology allow/deny lists here. Phrase spotting belongs to the syntax/language-unit extractor, which will feed exact candidates into this index.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -456,6 +347,8 @@ git commit -m "Add dependency resolver term index"
 ---
 
 ### Task 3: Add Simple Frame Extraction
+
+> Needs redesign before execution. The original Task 3 regex extractor below used finite predicate patterns and should not be implemented as written. Replace it with a frame-candidate contract or a syntax-backed extractor that emits explicit spans and predicates without growing hand-written word lists.
 
 **Files:**
 - Modify: `contextus/builder/dependency_resolver.py`
@@ -1347,7 +1240,7 @@ git commit -m "Add query proposition dependency adapter"
 Spec coverage:
 
 - Data classes are covered in Task 1.
-- Conservative term extraction is covered in Task 2.
+- Document term indexing from explicit candidates is covered in Task 2.
 - Simple syntax-to-frame projection is covered in Task 3.
 - Need creation is covered in Task 4.
 - Candidate search and strict simple closure are covered in Task 5.
@@ -1361,7 +1254,7 @@ First-slice exclusions:
 - No LLM proof judgment.
 - No complete predicate taxonomy.
 - No full integration into package ranking.
-- No spaCy dependency is required for this first slice; parser-backed extraction can replace the deterministic extractor after this traceable vertical slice works.
+- Do not add a raw-text phrase/frame extractor based on finite word lists. Task 3 must be redesigned around explicit frame candidates, syntax output, or another agreed non-list extractor before execution.
 
 Verification commands:
 

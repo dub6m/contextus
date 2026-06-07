@@ -4,6 +4,7 @@ from contextus.builder.dependency_resolver import (
     CandidateSupport,
     DocumentTerm,
     DocumentTermIndex,
+    TermCandidate,
     TermMention,
     normalize_term_text,
     FactFrame,
@@ -13,6 +14,22 @@ from contextus.builder.dependency_resolver import (
     ResolutionTraceStep,
     SourceRef,
 )
+
+
+def _term_candidate(
+    element_id: str,
+    source_text: str,
+    term_text: str,
+    source_signal: str = "syntax_noun_chunk",
+) -> TermCandidate:
+    start = source_text.index(term_text)
+    return TermCandidate(
+        element_id=element_id,
+        text=term_text,
+        char_start=start,
+        char_end=start + len(term_text),
+        source_signal=source_signal,
+    )
 
 
 def test_frame_slot_separates_fill_and_grounding_state():
@@ -189,41 +206,34 @@ def test_trace_step_converts_list_inputs_to_tuples():
 
 
 def test_normalize_term_text_is_conservative():
-    assert normalize_term_text("The strip.") == "strip"
-    assert normalize_term_text("candidate points") == "candidate point"
+    assert normalize_term_text(" Strip. ") == "strip"
+    assert normalize_term_text("candidate points") == "candidate points"
     assert normalize_term_text("median line") == "median line"
     assert normalize_term_text("line") == "line"
     assert normalize_term_text("Q_x") == "q_x"
 
 
-def test_normalize_term_text_preserves_singular_s_endings():
+def test_normalize_term_text_preserves_source_morphology():
     assert normalize_term_text("axis") == "axis"
     assert normalize_term_text("bias") == "bias"
     assert normalize_term_text("analysis") == "analysis"
     assert normalize_term_text("status") == "status"
-    assert normalize_term_text("points") == "point"
-
-
-def test_normalize_term_text_does_not_corrupt_common_s_endings():
-    assert normalize_term_text("lines") == "line"
-    assert normalize_term_text("sides") == "side"
+    assert normalize_term_text("points") == "points"
+    assert normalize_term_text("lines") == "lines"
+    assert normalize_term_text("sides") == "sides"
     assert normalize_term_text("series") == "series"
-    assert normalize_term_text("axis") == "axis"
-
-
-def test_normalize_term_text_avoids_risky_s_stripping():
     assert normalize_term_text("lens") == "lens"
     assert normalize_term_text("canvas") == "canvas"
     assert normalize_term_text("chaos") == "chaos"
-    assert normalize_term_text("points") == "point"
-    assert normalize_term_text("candidates") == "candidate"
 
 
 def test_document_term_index_keeps_specific_terms_separate():
-    index = DocumentTermIndex.from_texts(
+    text1 = "The median line splits the points."
+    text2 = "The line is drawn vertically."
+    index = DocumentTermIndex.from_candidates(
         [
-            ("e1", "The median line splits the points."),
-            ("e2", "The line is drawn vertically."),
+            _term_candidate("e1", text1, "median line"),
+            _term_candidate("e2", text2, "line"),
         ]
     )
 
@@ -234,38 +244,44 @@ def test_document_term_index_keeps_specific_terms_separate():
 
 
 def test_document_term_index_records_mentions_with_source():
-    index = DocumentTermIndex.from_texts([("e1", "The vertical strip contains candidate points.")])
+    text = "The vertical strip contains candidate points."
+    index = DocumentTermIndex.from_candidates([_term_candidate("e1", text, "vertical strip")])
 
     strip = index.terms["term:vertical_strip"]
     assert strip.canonical == "vertical strip"
     assert strip.mentions[0].element_id == "e1"
-    assert strip.mentions[0].source_signal == "nounish_span"
+    assert strip.mentions[0].source_signal == "syntax_noun_chunk"
 
 
-def test_document_term_index_does_not_cross_verbs_or_stopwords():
-    index = DocumentTermIndex.from_texts([("e1", "The median line splits the points.")])
+def test_document_term_index_from_texts_only_extracts_structural_symbols():
+    index = DocumentTermIndex.from_texts([("e1", "The median line splits the points near Q_x.")])
 
-    assert "term:median_line" in index.terms
-    assert "term:line" in index.terms
-    assert "term:line_split" not in index.terms
-    assert "term:median_line_split" not in index.terms
-    assert "term:split_the" not in index.terms
-    assert "term:split_the_point" not in index.terms
+    assert list(index.terms) == ["term:q_x"]
+    assert index.terms["term:q_x"].canonical == "q_x"
 
 
-def test_document_term_index_does_not_cross_intersect_verb():
-    index = DocumentTermIndex.from_texts([("e1", "The x axis intersects the y axis.")])
+def test_document_term_index_keeps_extractor_boundaries():
+    text = "The x axis intersects the y axis."
+    index = DocumentTermIndex.from_candidates(
+        [
+            _term_candidate("e1", text, "x axis"),
+            _term_candidate("e1", text, "y axis"),
+        ]
+    )
 
     assert "term:x_axis" in index.terms
     assert "term:y_axis" in index.terms
     assert "term:axis_intersect" not in index.terms
-    assert "term:x_axis_intersect" not in index.terms
-    assert "term:intersect_the" not in index.terms
-    assert "term:intersect_the_y" not in index.terms
 
 
-def test_document_term_index_does_not_cross_punctuation_boundaries():
-    index = DocumentTermIndex.from_texts([("e1", "Line. Median line.")])
+def test_document_term_index_keeps_punctuation_separated_when_spans_are_separate():
+    text = "Line. Median line."
+    index = DocumentTermIndex.from_candidates(
+        [
+            _term_candidate("e1", text, "Line"),
+            _term_candidate("e1", text, "Median line"),
+        ]
+    )
 
     assert "term:line" in index.terms
     assert "term:median_line" in index.terms
@@ -273,7 +289,8 @@ def test_document_term_index_does_not_cross_punctuation_boundaries():
 
 
 def test_document_term_index_mappings_are_immutable():
-    index = DocumentTermIndex.from_texts([("e1", "The median line.")])
+    text = "The median line."
+    index = DocumentTermIndex.from_candidates([_term_candidate("e1", text, "median line")])
 
     with pytest.raises(TypeError):
         index.terms["term:x"] = index.terms["term:median_line"]
@@ -282,19 +299,31 @@ def test_document_term_index_mappings_are_immutable():
         index.mentions_by_element_id["e2"] = ()
 
 
-def test_document_term_index_does_not_cross_dash_or_slash_boundaries():
-    index = DocumentTermIndex.from_texts([("e1", "Line - median line / candidate points")])
+def test_document_term_index_preserves_dash_or_slash_separated_spans():
+    text = "Line - median line / candidate points"
+    index = DocumentTermIndex.from_candidates(
+        [
+            _term_candidate("e1", text, "Line"),
+            _term_candidate("e1", text, "median line"),
+            _term_candidate("e1", text, "candidate points"),
+        ]
+    )
 
     assert "term:line" in index.terms
     assert "term:median_line" in index.terms
-    assert "term:candidate_point" in index.terms
+    assert "term:candidate_points" in index.terms
     assert "term:line_median" not in index.terms
     assert "term:line_candidate" not in index.terms
 
 
 def test_term_mentions_preserve_exact_source_span_text():
     text = "The vertical strip contains candidate points."
-    index = DocumentTermIndex.from_texts([("e1", text)])
+    index = DocumentTermIndex.from_candidates(
+        [
+            _term_candidate("e1", text, "vertical strip"),
+            _term_candidate("e1", text, "candidate points"),
+        ]
+    )
 
     for term in index.terms.values():
         for mention in term.mentions:
@@ -304,15 +333,15 @@ def test_term_mentions_preserve_exact_source_span_text():
 def test_term_models_normalize_nested_collections_from_direct_constructors():
     mention = TermMention(
         text="candidate points",
-        normalized="candidate point",
+        normalized="candidate points",
         element_id="e1",
         char_start=0,
         char_end=16,
-        source_signal="nounish_span",
+        source_signal="syntax_noun_chunk",
         modifiers=["candidate"],
     )
-    term = DocumentTerm(term_id="term:candidate_point", canonical="candidate point", mentions=[mention])
-    index = DocumentTermIndex(terms={"term:candidate_point": term}, mentions_by_element_id={"e1": [mention]})
+    term = DocumentTerm(term_id="term:candidate_points", canonical="candidate points", mentions=[mention])
+    index = DocumentTermIndex(terms={"term:candidate_points": term}, mentions_by_element_id={"e1": [mention]})
 
     assert mention.modifiers == ("candidate",)
     assert term.mentions == (mention,)
