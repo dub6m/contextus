@@ -77,4 +77,5 @@ def test_trace_step_records_action_reason_and_frames():
     )
 
     assert step.action == "need_resolved"
+    assert step.reason == "candidate frame covers the unsupported quantity"
     assert step.frame_ids == ["frame:e2:0"]
