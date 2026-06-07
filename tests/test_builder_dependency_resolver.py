@@ -1,3 +1,5 @@
+import pytest
+
 from contextus.builder.dependency_resolver import (
     CandidateSupport,
     FactFrame,
@@ -40,6 +42,12 @@ def test_frame_slot_does_not_require_support_by_default():
     assert slot.requires_support is False
 
 
+def test_frame_slot_converts_evidence_refs_to_tuple():
+    slot = FrameSlot(name="object", evidence_refs=["e1"])
+
+    assert slot.evidence_refs == ("e1",)
+
+
 def test_frame_constraint_requires_support_until_grounded():
     unsupported_constraint = FrameConstraint(target_slot="object", operator="=", value="candidate points")
     grounded_constraint = FrameConstraint(
@@ -51,6 +59,12 @@ def test_frame_constraint_requires_support_until_grounded():
 
     assert unsupported_constraint.requires_support is True
     assert grounded_constraint.requires_support is False
+
+
+def test_frame_constraint_converts_evidence_refs_to_tuple():
+    constraint = FrameConstraint(target_slot="object", operator="=", value="candidate points", evidence_refs=["e1"])
+
+    assert constraint.evidence_refs == ("e1",)
 
 
 def test_need_points_to_exact_frame_part():
@@ -109,6 +123,20 @@ def test_fact_frame_keeps_source_reference():
     assert frame.slots["subject"].value == "strip"
 
 
+def test_fact_frame_converts_constraints_and_links_to_tuples():
+    constraint = FrameConstraint(target_slot="object", operator="=", value="candidate points")
+    frame = FactFrame(
+        frame_id="frame:e1:0",
+        source=SourceRef(element_id="e1"),
+        predicate="contains",
+        constraints=[constraint],
+        links=["frame:other"],
+    )
+
+    assert frame.constraints == (constraint,)
+    assert frame.links == ("frame:other",)
+
+
 def test_fact_frame_slots_are_not_externally_mutable():
     frame = FactFrame(
         frame_id="frame:e1:0",
@@ -117,12 +145,24 @@ def test_fact_frame_slots_are_not_externally_mutable():
         slots={"subject": FrameSlot(name="subject", value="strip", term_id="term:strip")},
     )
 
-    try:
+    with pytest.raises(TypeError):
         frame.slots["x"] = FrameSlot(name="x")
-    except TypeError:
-        pass
-    else:
-        raise AssertionError("FactFrame.slots should reject assignment")
+
+
+def test_fact_frame_slots_are_copied_before_wrapping():
+    slots = {"subject": FrameSlot(name="subject", value="strip", term_id="term:strip")}
+    frame = FactFrame(
+        frame_id="frame:e1:0",
+        source=SourceRef(element_id="e1"),
+        predicate="contains",
+        slots=slots,
+    )
+
+    slots["subject"] = FrameSlot(name="subject", value="changed", term_id="term:changed")
+    slots["object"] = FrameSlot(name="object")
+
+    assert frame.slots["subject"].value == "strip"
+    assert "object" not in frame.slots
 
 
 def test_trace_step_records_action_reason_and_frames():

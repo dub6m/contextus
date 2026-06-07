@@ -31,6 +31,9 @@ class FrameSlot:
     def requires_support(self) -> bool:
         return self.fill_state in {"missing", "ambiguous"} or self.grounding_state == "unsupported"
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_refs", tuple(self.evidence_refs))
+
 
 @dataclass(frozen=True)
 class FrameConstraint:
@@ -48,6 +51,9 @@ class FrameConstraint:
     def requires_support(self) -> bool:
         return self.grounding_state == "unsupported"
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_refs", tuple(self.evidence_refs))
+
 
 @dataclass(frozen=True)
 class FactFrame:
@@ -61,6 +67,8 @@ class FactFrame:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "slots", MappingProxyType(dict(self.slots)))
+        object.__setattr__(self, "constraints", tuple(self.constraints))
+        object.__setattr__(self, "links", tuple(self.links))
 
 
 @dataclass(frozen=True)
