@@ -21,7 +21,7 @@ _FORMULA_SYMBOL_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:[A-Za-z](?:_[A-Za-z0-9]+)?(?:\([A-Za-z0-9_+\-*/ ]+\))?|O\([^)]+\))(?![A-Za-z0-9_])"
 )
 _NUMBERED_HEADING_RE = re.compile(r"^\s*(\d+(?:\.\d+){0,5})(?:\s+|$)")
-_LIST_MARKER_RE = re.compile(r"^\s*((?:[-*\u2022])|(?:\d{1,3}[.)])|(?:[A-Za-z][.)])|(?:[ivxlcdmIVXLCDM]{1,6}[.)]))\s+")
+_LIST_MARKER_RE = re.compile(r"^\s*((?:[-*\u2022])|(?:\d{1,3}[.)]?)|(?:[A-Za-z][.)])|(?:[ivxlcdmIVXLCDM]{1,6}[.)]))\s+")
 
 
 STOPWORDS = {

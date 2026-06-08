@@ -4,7 +4,7 @@ import hashlib
 from collections import defaultdict
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Mapping
+from typing import Mapping, Protocol
 
 
 @dataclass(frozen=True)
@@ -386,6 +386,50 @@ class ResolvedPackage:
         object.__setattr__(self, "resolution_trace", tuple(self.resolution_trace))
 
 
+class SupportVerifier(Protocol):
+    def supports(self, *, need: Need, source_frame: FactFrame, candidate_frame: FactFrame) -> bool:
+        ...
+
+
+class CrossEncoderNliSupportVerifier:
+    def __init__(
+        self,
+        model_name: str = "cross-encoder/nli-deberta-v3-base",
+        *,
+        entailment_threshold: float = 0.55,
+        contradiction_ceiling: float = 0.35,
+    ) -> None:
+        from sentence_transformers import CrossEncoder
+
+        self.model = CrossEncoder(model_name)
+        self.entailment_threshold = float(entailment_threshold)
+        self.contradiction_ceiling = float(contradiction_ceiling)
+        self._cache: dict[tuple[str, str], bool] = {}
+        self._labels = {
+            int(index): str(label).lower()
+            for index, label in getattr(getattr(self.model, "model", None), "config", object()).id2label.items()
+        } if hasattr(getattr(getattr(self.model, "model", None), "config", object()), "id2label") else {}
+
+    def supports(self, *, need: Need, source_frame: FactFrame, candidate_frame: FactFrame) -> bool:
+        premise = candidate_frame.source.text.strip()
+        hypothesis = _candidate_support_statement(candidate_frame)
+        if not premise or not hypothesis:
+            return False
+        key = (premise, hypothesis)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        raw_scores = self.model.predict([(premise, hypothesis)], apply_softmax=True)
+        scores = list(raw_scores[0] if hasattr(raw_scores[0], "__iter__") else raw_scores)
+        entailment_index = _label_index(self._labels, "entail", fallback=1 if len(scores) > 1 else 0)
+        contradiction_index = _label_index(self._labels, "contrad", fallback=0)
+        entailment = float(scores[entailment_index]) if entailment_index < len(scores) else 0.0
+        contradiction = float(scores[contradiction_index]) if contradiction_index < len(scores) else 0.0
+        accepted = entailment >= self.entailment_threshold and contradiction <= self.contradiction_ceiling
+        self._cache[key] = accepted
+        return accepted
+
+
 class NeedBuilder:
     def needs_for_frame(self, frame: FactFrame) -> list[Need]:
         needs: list[Need] = []
@@ -424,15 +468,36 @@ class NeedBuilder:
 
 
 class DependencyResolver:
+    def __init__(
+        self,
+        *,
+        max_depth: int = 0,
+        max_selected_frames: int = 32,
+        support_verifier: SupportVerifier | None = None,
+    ) -> None:
+        self.max_depth = max(0, int(max_depth))
+        self.max_selected_frames = max(1, int(max_selected_frames))
+        self.support_verifier = support_verifier
+
     def resolve(self, *, core_frames: list[FactFrame], document_frames: list[FactFrame]) -> ResolvedPackage:
         need_builder = NeedBuilder()
         trace: list[ResolutionTraceStep] = []
-        needs: list[Need] = []
         frame_by_id = {frame.frame_id: frame for frame in core_frames}
+        document_frame_by_id = {frame.frame_id: frame for frame in document_frames}
+        all_frame_by_id = {**document_frame_by_id, **frame_by_id}
+        worklist: list[tuple[FactFrame, int]] = [(frame, 0) for frame in core_frames]
+        processed_frame_ids: set[str] = set()
 
-        for frame in core_frames:
+        resolved: list[Need] = []
+        unresolved: list[Need] = []
+        selected_by_id: dict[str, FactFrame] = {}
+
+        while worklist:
+            frame, depth = worklist.pop(0)
+            if frame.frame_id in processed_frame_ids:
+                continue
+            processed_frame_ids.add(frame.frame_id)
             created = need_builder.needs_for_frame(frame)
-            needs.extend(created)
             for need in created:
                 trace.append(
                     ResolutionTraceStep(
@@ -442,55 +507,58 @@ class DependencyResolver:
                         reason=f"{need.target_path} is {need.reason}",
                     )
                 )
-
-        resolved: list[Need] = []
-        unresolved: list[Need] = []
-        selected_by_id: dict[str, FactFrame] = {}
-        document_candidates = list(document_frames)
-
-        for need in needs:
-            source_frame = frame_by_id.get(need.frame_id)
-            support = self._find_support(need, source_frame=source_frame, document_frames=document_candidates)
-            if support.rejected_candidate_frame_ids:
-                trace.append(
-                    ResolutionTraceStep(
-                        action="candidate_rejected",
-                        need_id=need.need_id,
-                        frame_ids=support.rejected_candidate_frame_ids,
-                        reason="; ".join(support.rejected_parts) or "candidate rejected",
+                candidate_frames = [
+                    candidate
+                    for candidate in all_frame_by_id.values()
+                    if candidate.frame_id != frame.frame_id
+                ]
+                support = self._find_support(need, source_frame=frame, document_frames=candidate_frames)
+                if support.rejected_candidate_frame_ids:
+                    trace.append(
+                        ResolutionTraceStep(
+                            action="candidate_rejected",
+                            need_id=need.need_id,
+                            frame_ids=support.rejected_candidate_frame_ids,
+                            reason="; ".join(support.rejected_parts) or "candidate rejected",
+                        )
                     )
-                )
-            if support.status == "accepted":
-                resolved_need = Need(
-                    need_id=need.need_id,
-                    frame_id=need.frame_id,
-                    target_path=need.target_path,
-                    value=need.value,
-                    reason=need.reason,
-                    status="resolved",
-                )
-                resolved.append(resolved_need)
-                for frame in document_candidates:
-                    if frame.frame_id in support.candidate_frame_ids:
-                        selected_by_id[frame.frame_id] = frame
-                trace.append(
-                    ResolutionTraceStep(
-                        action="need_resolved",
+                if support.status == "accepted":
+                    resolved_need = Need(
                         need_id=need.need_id,
-                        frame_ids=support.candidate_frame_ids,
-                        reason=support.reason,
+                        frame_id=need.frame_id,
+                        target_path=need.target_path,
+                        value=need.value,
+                        reason=need.reason,
+                        status="resolved",
                     )
-                )
-            else:
-                unresolved.append(need)
-                trace.append(
-                    ResolutionTraceStep(
-                        action="candidate_rejected",
-                        need_id=need.need_id,
-                        frame_ids=support.candidate_frame_ids or support.rejected_candidate_frame_ids,
-                        reason=support.reason or "no acceptable candidate support",
+                    resolved.append(resolved_need)
+                    for candidate_frame_id in support.candidate_frame_ids:
+                        candidate_frame = all_frame_by_id.get(candidate_frame_id)
+                        if candidate_frame is None:
+                            continue
+                        if candidate_frame_id in document_frame_by_id:
+                            selected_by_id[candidate_frame_id] = candidate_frame
+                        if depth < self.max_depth and candidate_frame_id not in processed_frame_ids:
+                            if len(selected_by_id) <= self.max_selected_frames:
+                                worklist.append((candidate_frame, depth + 1))
+                    trace.append(
+                        ResolutionTraceStep(
+                            action="need_resolved",
+                            need_id=need.need_id,
+                            frame_ids=support.candidate_frame_ids,
+                            reason=support.reason,
+                        )
                     )
-                )
+                else:
+                    unresolved.append(need)
+                    trace.append(
+                        ResolutionTraceStep(
+                            action="candidate_rejected",
+                            need_id=need.need_id,
+                            frame_ids=support.candidate_frame_ids or support.rejected_candidate_frame_ids,
+                            reason=support.reason or "no acceptable candidate support",
+                        )
+                    )
 
         selected_frames = tuple(selected_by_id.values())
         combined_frames = tuple(core_frames) + selected_frames
@@ -595,16 +663,43 @@ class DependencyResolver:
         source_slot = source_frame.slots.get(slot_name)
         if source_slot is None:
             return CandidateSupport(need_id=need.need_id, candidate_frame_ids=(), matched_parts=(), reason="source slot missing")
+        rejected_frame_ids: list[str] = []
+        rejected_parts: list[str] = []
         for candidate in document_frames:
-            for candidate_slot in candidate.slots.values():
+            for candidate_slot_name, candidate_slot in candidate.slots.items():
                 if _same_slot_target(source_slot, candidate_slot):
+                    if not _candidate_adds_information(
+                        source_slot=source_slot,
+                        source_frame=source_frame,
+                        candidate_frame=candidate,
+                        matched_slot_name=candidate_slot_name,
+                    ):
+                        rejected_frame_ids.append(candidate.frame_id)
+                        rejected_parts.append(f"{candidate.frame_id}: same target without added information")
+                        continue
+                    if not self._verifier_accepts(need=need, source_frame=source_frame, candidate_frame=candidate):
+                        rejected_frame_ids.append(candidate.frame_id)
+                        rejected_parts.append(f"{candidate.frame_id}: verifier rejected candidate support")
+                        continue
                     return CandidateSupport(
                         need_id=need.need_id,
                         candidate_frame_ids=(candidate.frame_id,),
-                        matched_parts=("target term",),
+                        matched_parts=("target term", "added information"),
+                        rejected_parts=tuple(rejected_parts),
+                        rejected_candidate_frame_ids=tuple(rejected_frame_ids),
                         status="accepted",
-                        reason="candidate frame mentions the same target term",
+                        reason="candidate frame targets the missing term and adds information",
                     )
+        if rejected_frame_ids:
+            return CandidateSupport(
+                need_id=need.need_id,
+                candidate_frame_ids=tuple(rejected_frame_ids),
+                matched_parts=(),
+                rejected_parts=tuple(rejected_parts),
+                rejected_candidate_frame_ids=tuple(rejected_frame_ids),
+                status="rejected",
+                reason="no candidate with the same target added usable information",
+            )
         return CandidateSupport(need_id=need.need_id, candidate_frame_ids=(), matched_parts=(), reason="no matching support frame")
 
     def _find_constraint_support(
@@ -634,6 +729,10 @@ class DependencyResolver:
                     rejected_parts.append(f"{candidate.frame_id}: target term mismatch")
                     continue
                 if _constraint_covers(source_constraint, candidate_constraint):
+                    if not self._verifier_accepts(need=need, source_frame=source_frame, candidate_frame=candidate):
+                        rejected_frame_ids.append(candidate.frame_id)
+                        rejected_parts.append(f"{candidate.frame_id}: verifier rejected candidate support")
+                        continue
                     return CandidateSupport(
                         need_id=need.need_id,
                         candidate_frame_ids=(candidate.frame_id,),
@@ -657,6 +756,17 @@ class DependencyResolver:
             )
         return CandidateSupport(need_id=need.need_id, candidate_frame_ids=(), matched_parts=(), reason="no matching support frame")
 
+    def _verifier_accepts(self, *, need: Need, source_frame: FactFrame, candidate_frame: FactFrame) -> bool:
+        if self.support_verifier is None:
+            return True
+        return bool(
+            self.support_verifier.supports(
+                need=need,
+                source_frame=source_frame,
+                candidate_frame=candidate_frame,
+            )
+        )
+
 
 def _same_slot_target(left: FrameSlot, right: FrameSlot) -> bool:
     if left.term_id and right.term_id:
@@ -672,6 +782,53 @@ def _constraint_covers(required: FrameConstraint, candidate: FrameConstraint) ->
     if required.operator == "constant_bound":
         return candidate.operator in {"<", "<=", "="} and candidate.value_kind == "constant"
     return False
+
+
+def _candidate_adds_information(
+    *,
+    source_slot: FrameSlot,
+    source_frame: FactFrame,
+    candidate_frame: FactFrame,
+    matched_slot_name: str,
+) -> bool:
+    if candidate_frame.constraints:
+        return True
+    source_values = {
+        normalize_term_text(slot.value)
+        for slot in source_frame.slots.values()
+        if slot.value
+    }
+    source_values.add(normalize_term_text(source_slot.value))
+    for slot_name, slot in candidate_frame.slots.items():
+        if slot_name == matched_slot_name:
+            continue
+        normalized = normalize_term_text(slot.value)
+        if normalized and normalized not in source_values:
+            return True
+    return False
+
+
+def _candidate_support_statement(frame: FactFrame) -> str:
+    target = frame.slots.get("target")
+    value = frame.slots.get("value")
+    if target is not None and value is not None and target.value and value.value:
+        return f"{target.source_text or target.value} is supported by {value.source_text or value.value}"
+    if target is not None and frame.constraints:
+        constraint_text = "; ".join(
+            " ".join(part for part in (target.source_text or target.value, constraint.operator, constraint.source_text or constraint.value) if part)
+            for constraint in frame.constraints
+        )
+        return constraint_text.strip()
+    parts = [frame.predicate]
+    parts.extend(slot.source_text or slot.value for slot in frame.slots.values() if slot.value)
+    return "; ".join(part for part in parts if part).strip()
+
+
+def _label_index(labels: Mapping[int, str], needle: str, *, fallback: int) -> int:
+    for index, label in labels.items():
+        if needle in label:
+            return index
+    return fallback
 
 
 def _canonical_cycle(cycle: tuple[str, ...]) -> tuple[str, ...]:

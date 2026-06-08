@@ -712,6 +712,129 @@ def test_resolver_traces_rejected_candidate_before_later_acceptance():
     assert result.resolved_needs
 
 
+def test_resolver_rejects_same_target_frame_without_added_information():
+    term_index = DocumentTermIndex.from_candidates(
+        [
+            _term_candidate("core", "Mitosis and meiosis.", "Mitosis and meiosis"),
+            _term_candidate("repeat", "Mitosis and meiosis.", "Mitosis and meiosis"),
+        ]
+    )
+    core_frame, repeated_frame = FrameCandidateProjector(term_index).project(
+        [
+            FrameCandidate(
+                frame_id="frame:core",
+                element_id="core",
+                proposition_id="core::p00",
+                predicate="heading",
+                slots={"target": _slot_candidate("target", "Mitosis and meiosis", "Mitosis and meiosis")},
+            ),
+            FrameCandidate(
+                frame_id="frame:repeat",
+                element_id="repeat",
+                proposition_id="repeat::p00",
+                predicate="heading",
+                slots={"target": _slot_candidate("target", "Mitosis and meiosis", "Mitosis and meiosis")},
+            ),
+        ]
+    )
+
+    result = DependencyResolver().resolve(core_frames=[core_frame], document_frames=[repeated_frame])
+
+    assert not result.resolved_needs
+    assert result.unresolved_needs
+    assert not result.selected_frames
+
+
+def test_resolver_uses_verifier_to_reject_structural_slot_match():
+    class RejectingVerifier:
+        def supports(self, *, need, source_frame, candidate_frame):
+            return False
+
+    term_index = DocumentTermIndex.from_candidates(
+        [
+            _term_candidate("core", "Alpha proof depends on candidate points.", "candidate points"),
+            _term_candidate("support", "candidate points have a bound.", "candidate points"),
+        ]
+    )
+    core_frame, support_frame = FrameCandidateProjector(term_index).project(
+        [
+            FrameCandidate(
+                frame_id="frame:core",
+                element_id="core",
+                proposition_id="core::p00",
+                predicate="proof_reason",
+                slots={"value": _slot_candidate("value", "candidate points", "candidate points")},
+            ),
+            FrameCandidate(
+                frame_id="frame:support",
+                element_id="support",
+                proposition_id="support::p00",
+                predicate="quantity_bound",
+                slots={
+                    "target": _slot_candidate("target", "candidate points", "candidate points"),
+                    "value": _slot_candidate("value", "constant bound", "constant bound"),
+                },
+            ),
+        ]
+    )
+
+    result = DependencyResolver(support_verifier=RejectingVerifier()).resolve(
+        core_frames=[core_frame],
+        document_frames=[support_frame],
+    )
+
+    assert not result.resolved_needs
+    assert any("verifier rejected" in step.reason for step in result.resolution_trace)
+
+
+def test_resolver_recursively_resolves_selected_support_frame_needs():
+    term_index = DocumentTermIndex.from_candidates(
+        [
+            _term_candidate("core", "Alpha claim depends on candidate points.", "candidate points"),
+            _term_candidate("mid", "candidate points depend on strip points.", "candidate points"),
+            _term_candidate("mid", "candidate points depend on strip points.", "strip points"),
+            _term_candidate("source", "strip points are introduced by the strip lemma.", "strip points"),
+            _term_candidate("source", "strip points are introduced by the strip lemma.", "strip lemma"),
+        ]
+    )
+    core_frame = FrameCandidateProjector(term_index).project(
+        [
+            FrameCandidate(
+                frame_id="frame:core",
+                element_id="core",
+                proposition_id="core::p00",
+                predicate="claim",
+                slots={"dependency": _slot_candidate("dependency", "candidate points", "candidate points")},
+            ),
+            FrameCandidate(
+                frame_id="frame:mid",
+                element_id="mid",
+                proposition_id="mid::p00",
+                predicate="definition",
+                slots={
+                    "target": _slot_candidate("target", "candidate points", "candidate points"),
+                    "dependency": _slot_candidate("dependency", "strip points", "strip points"),
+                },
+            ),
+            FrameCandidate(
+                frame_id="frame:source",
+                element_id="source",
+                proposition_id="source::p00",
+                predicate="definition",
+                slots={
+                    "target": _slot_candidate("target", "strip points", "strip points"),
+                    "value": _slot_candidate("value", "strip lemma", "strip lemma"),
+                },
+            ),
+        ]
+    )
+
+    result = DependencyResolver(max_depth=2).resolve(core_frames=[core_frame[0]], document_frames=core_frame[1:])
+
+    assert [frame.frame_id for frame in result.selected_frames] == ["frame:mid", "frame:source"]
+    assert "need:frame:mid:slots.dependency" in {need.need_id for need in result.resolved_needs}
+
+
 def test_resolver_records_cycle_without_expanding_forever():
     frame_a = FactFrame(
         frame_id="frame:a",

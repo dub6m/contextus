@@ -14,6 +14,16 @@ from contextus.llm import LLMClient, LLMRequest
 from contextus.ingestion.models import ExtractedDocument
 
 from .config import BuilderConfig
+from .dependency_resolver import (
+    DependencyResolver,
+    DocumentTermIndex,
+    FrameCandidate,
+    ResolvedPackage,
+    SlotCandidate,
+    SupportVerifier,
+    TermCandidate,
+    normalize_term_text,
+)
 from .evidence import ElementSignalRecord, EvidenceHandleBuilder
 from .preprocessor import ElementPreprocessor
 
@@ -113,6 +123,47 @@ VAGUE_ROLE_TARGETS = {
     "text",
     "thing",
 }
+SOURCE_TRAVERSAL_GENERIC_CLAIM_UNITS = {
+    "annotation",
+    "annotations",
+    "arrow",
+    "arrows",
+    "bordered",
+    "bottom",
+    "cell",
+    "cells",
+    "chart",
+    "column",
+    "columns",
+    "content",
+    "diagram",
+    "figure",
+    "figures",
+    "grid",
+    "grey",
+    "image",
+    "images",
+    "label",
+    "labeled",
+    "labels",
+    "left",
+    "light",
+    "map",
+    "panel",
+    "panels",
+    "picture",
+    "pictures",
+    "right",
+    "row",
+    "rows",
+    "show",
+    "showing",
+    "shows",
+    "source",
+    "table",
+    "text",
+    "top",
+}
 
 
 @dataclass(frozen=True)
@@ -206,9 +257,114 @@ class QueryAssembledPackage:
     decisions: list[QueryAssemblyDecision] = field(default_factory=list)
     completion_diagnostics: CompletionDiagnostics | None = None
     ranking_diagnostics: PackageRankingDiagnostics | None = None
+    seed_core_element_id: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class QueryAnswerBundlePart:
+    sub_need: str
+    search_terms: list[str]
+    expected_roles: list[str]
+    package: QueryAssembledPackage
+
+
+@dataclass(frozen=True)
+class QueryAnswerBundle:
+    bundle_id: str
+    prompt: str
+    parts: list[QueryAnswerBundlePart]
+
+    @property
+    def packages(self) -> list[QueryAssembledPackage]:
+        return [part.package for part in self.parts]
+
+
+@dataclass(frozen=True)
+class SourceTraversalAnswerBundlePart:
+    part_id: str
+    role: str
+    display_label: str
+    center_id: str
+    trace_anchor_element_id: str
+    topic_terms: list[str]
+    claim_units: list[str]
+    evidence_element_ids: list[str]
+    package: QueryAssembledPackage
+
+
+@dataclass(frozen=True)
+class SourceTraversalAnswerBundle:
+    bundle_id: str
+    prompt: str
+    parts: list[SourceTraversalAnswerBundlePart]
+
+    @property
+    def packages(self) -> list[QueryAssembledPackage]:
+        return [part.package for part in self.parts]
+
+
+@dataclass(frozen=True)
+class SourceTraversalCandidateTrace:
+    round_number: int
+    proposition_id: str
+    element_id: str
+    center_id: str
+    center_decision: str
+    relation_tags: list[str]
+    prompt_similarity: float
+    state_similarity: float
+    novelty_score: float
+    redundancy_score: float
+    relation_score: float
+    role_contribution_score: float
+    token_count: int
+    action: str
+    reason: str
+    text_preview: str = ""
+    answer_contribution: str = ""
+    matched_claim_units: list[str] = field(default_factory=list)
+    new_needed_units: list[str] = field(default_factory=list)
+    foreign_claim_tokens: list[str] = field(default_factory=list)
+    frame_continuation: str = ""
+
+
+@dataclass(frozen=True)
+class SourceTraversalTrace:
+    anchor_proposition_id: str
+    anchor_element_id: str
+    anchor_text_preview: str
+    accepted_proposition_ids: list[str]
+    accepted_element_ids: list[str]
+    centers: list[dict[str, object]] = field(default_factory=list)
+    candidates: list[SourceTraversalCandidateTrace] = field(default_factory=list)
+    dead_end_reason: str = ""
+
+
+@dataclass(frozen=True)
+class _SourceTraversalVocabularyCache:
+    key: str
+    unit_counts: Counter[str]
+    claim_unit_counts: Counter[str]
+    units_by_index: tuple[frozenset[str], ...]
+    claim_units_by_index: tuple[frozenset[str], ...]
+
+
+@dataclass(frozen=True)
+class _DocumentAssemblyCache:
+    key: str
+    proposition_embeddings: np.ndarray
+    graph: dict[int, dict[int, "_ConsensusEdge"]]
+    relation_geometry: "_DocumentRelationGeometry | None"
+
+
+@dataclass(frozen=True)
+class _DocumentLanguageCache:
+    key: str
+    language_map: "_DocumentLanguageMap"
+    unit_embeddings: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -217,9 +373,49 @@ class QueryAssemblyResult:
     packages: list[QueryAssembledPackage]
     propositions: list["QueryEvidenceProposition"] = field(default_factory=list)
     retrieval_plan: "QueryRetrievalPlan | None" = None
+    dependency_packages: list[ResolvedPackage] = field(default_factory=list)
+    answer_bundle: QueryAnswerBundle | None = None
+    source_traversals: list[SourceTraversalTrace] = field(default_factory=list)
+    source_traversal_packages: list[QueryAssembledPackage] = field(default_factory=list)
+    source_traversal_answer_bundle: SourceTraversalAnswerBundle | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(replace(self, dependency_packages=[]))
+        payload["dependency_packages"] = [
+            _resolved_package_to_dict(package)
+            for package in self.dependency_packages
+        ]
+        return payload
+
+
+def _resolved_package_to_dict(package: ResolvedPackage) -> dict[str, object]:
+    return {
+        "core_frames": [_fact_frame_to_dict(frame) for frame in package.core_frames],
+        "selected_frames": [_fact_frame_to_dict(frame) for frame in package.selected_frames],
+        "selected_elements": list(package.selected_elements),
+        "resolved_needs": [asdict(need) for need in package.resolved_needs],
+        "unresolved_needs": [asdict(need) for need in package.unresolved_needs],
+        "cycles": [list(cycle) for cycle in package.cycles],
+        "resolution_trace": [asdict(step) for step in package.resolution_trace],
+    }
+
+
+def _fact_frame_to_dict(frame: object) -> dict[str, object]:
+    return {
+        "frame_id": getattr(frame, "frame_id", ""),
+        "source": asdict(getattr(frame, "source")),
+        "predicate": getattr(frame, "predicate", ""),
+        "slots": {
+            name: asdict(slot)
+            for name, slot in getattr(frame, "slots", {}).items()
+        },
+        "constraints": [
+            asdict(constraint)
+            for constraint in getattr(frame, "constraints", ())
+        ],
+        "links": list(getattr(frame, "links", ())),
+        "extraction_status": getattr(frame, "extraction_status", ""),
+    }
 
 
 @dataclass(frozen=True)
@@ -282,6 +478,15 @@ class _RoleCompletionCandidate:
     score: float
     reason: str
     role_keys: frozenset[str] = field(default_factory=frozenset)
+
+
+@dataclass(frozen=True)
+class _DependencyTermSeed:
+    text: str
+    char_start: int
+    char_end: int
+    source_signal: str
+    priority: float = 0.0
 
 
 @dataclass
@@ -449,16 +654,24 @@ class QueryTimeEvidenceAssembler:
             for support_id in core_candidate.support_element_ids
             if support_id != signals[core_index].element_id
         }
+        final_core_signal, final_core_embedding = self._select_final_core(
+            selected,
+            seed_core_element_id=signals[core_index].element_id,
+        )
         package_text = self._package_text(
             selected,
-            core_element_id=signals[core_index].element_id,
+            core_element_id=final_core_signal.element_id,
             role_by_id=role_by_id,
         )
+        package_embedding = self._embed([package_text])[0]
+        package_prompt_similarity = float(np.dot(package_embedding, prompt_embedding))
+        package_core_similarity = float(np.dot(package_embedding, final_core_embedding))
+        final_core_prompt_similarity = float(np.dot(final_core_embedding, prompt_embedding))
         token_count = sum(signal.token_count for signal in selected)
         score = self._package_score(
-            package_prompt_similarity=state.query_similarity,
-            package_core_similarity=state.core_similarity,
-            core_prompt_similarity=core_candidate.prompt_similarity,
+            package_prompt_similarity=package_prompt_similarity,
+            package_core_similarity=package_core_similarity,
+            core_prompt_similarity=final_core_prompt_similarity,
             token_count=token_count,
         )
         package_id = f"query-package-{package_index:05d}"
@@ -466,11 +679,12 @@ class QueryTimeEvidenceAssembler:
             package_id = f"query-proposition-package-{package_index:05d}"
         return QueryAssembledPackage(
             package_id=package_id,
-            core_element_id=signals[core_index].element_id,
-            core_index=core_index,
-            core_prompt_similarity=round(core_candidate.prompt_similarity, 4),
-            package_prompt_similarity=round(state.query_similarity, 4),
-            package_core_similarity=round(state.core_similarity, 4),
+            core_element_id=final_core_signal.element_id,
+            core_index=final_core_signal.element_index,
+            seed_core_element_id=signals[core_index].element_id,
+            core_prompt_similarity=round(final_core_prompt_similarity, 4),
+            package_prompt_similarity=round(package_prompt_similarity, 4),
+            package_core_similarity=round(package_core_similarity, 4),
             element_ids=[signal.element_id for signal in selected],
             package_text=package_text,
             token_count=token_count,
@@ -478,13 +692,85 @@ class QueryTimeEvidenceAssembler:
                 score
                 + self._answerability_bonus(
                     signals=selected,
-                    core_element_id=signals[core_index].element_id,
+                    core_element_id=final_core_signal.element_id,
                     proposition_text=core_candidate.proposition_text,
                 ),
                 4,
             ),
             decisions=decisions,
         )
+
+    def _select_final_core(
+        self,
+        selected: list[ElementSignalRecord],
+        *,
+        seed_core_element_id: str,
+        propositions: list[QueryEvidenceProposition] | None = None,
+    ) -> tuple[ElementSignalRecord, np.ndarray]:
+        if not selected:
+            raise ValueError("cannot select a final core from an empty package")
+        seed_signal = next((signal for signal in selected if signal.element_id == seed_core_element_id), selected[0])
+        embeddings = self._embed([signal.text for signal in selected])
+        if len(selected) == 1:
+            return selected[0], embeddings[0]
+        element_winner = self._medoid_element_id(
+            element_ids=[signal.element_id for signal in selected],
+            texts=[signal.text for signal in selected],
+        )
+        proposition_winner = self._proposition_medoid_element_id(
+            selected=selected,
+            propositions=propositions or [],
+        )
+        if element_winner is None or proposition_winner is None or element_winner != proposition_winner:
+            seed_index = next(
+                (index for index, signal in enumerate(selected) if signal.element_id == seed_signal.element_id),
+                0,
+            )
+            return seed_signal, embeddings[seed_index]
+        final_index = next(
+            (index for index, signal in enumerate(selected) if signal.element_id == element_winner),
+            0,
+        )
+        return selected[final_index], embeddings[final_index]
+
+    def _medoid_element_id(self, *, element_ids: list[str], texts: list[str]) -> str | None:
+        if not element_ids or len(element_ids) != len(texts):
+            return None
+        embeddings = self._embed(texts)
+        if len(element_ids) == 1:
+            return element_ids[0]
+        centroid = _normalize(np.mean(embeddings, axis=0))[0]
+        similarities = embeddings @ centroid
+        ranked = np.argsort(-similarities)
+        best_index = int(ranked[0])
+        if len(ranked) > 1 and np.isclose(similarities[best_index], similarities[int(ranked[1])]):
+            return None
+        return element_ids[best_index]
+
+    def _proposition_medoid_element_id(
+        self,
+        *,
+        selected: list[ElementSignalRecord],
+        propositions: list[QueryEvidenceProposition],
+    ) -> str | None:
+        if not propositions:
+            return None
+        selected_ids = {signal.element_id for signal in selected}
+        by_element: dict[str, list[str]] = defaultdict(list)
+        for proposition in propositions:
+            if proposition.element_id in selected_ids and proposition.text.strip():
+                by_element[proposition.element_id].append(proposition.text)
+        element_ids: list[str] = []
+        texts: list[str] = []
+        for signal in selected:
+            proposition_texts = by_element.get(signal.element_id)
+            if not proposition_texts:
+                continue
+            element_ids.append(signal.element_id)
+            texts.append(" ".join(proposition_texts))
+        if len(element_ids) != len(selected):
+            return None
+        return self._medoid_element_id(element_ids=element_ids, texts=texts)
 
     def _attach_explicit_support(
         self,
@@ -2119,6 +2405,19 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
         language_candidate_weight: float = 0.06,
         language_candidate_slots: int = 1,
         min_language_core_score: float = 0.45,
+        use_relation_geometry: bool = True,
+        relation_geometry_weight: float = 0.06,
+        relation_family_similarity: float = 0.82,
+        min_relation_family_size: int = 3,
+        use_source_traversal_audit: bool = True,
+        source_traversal_anchor_limit: int = 3,
+        source_traversal_rounds: int = 2,
+        source_traversal_accepts_per_round: int = 3,
+        source_traversal_candidate_limit: int = 16,
+        use_dependency_resolver: bool = False,
+        dependency_resolver_depth: int = 2,
+        dependency_resolver_max_frames: int = 32,
+        dependency_support_verifier: SupportVerifier | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -2144,7 +2443,23 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
         self.language_candidate_weight = max(0.0, float(language_candidate_weight))
         self.language_candidate_slots = max(0, int(language_candidate_slots))
         self.min_language_core_score = max(0.0, float(min_language_core_score))
+        self.use_relation_geometry = bool(use_relation_geometry)
+        self.relation_geometry_weight = max(0.0, float(relation_geometry_weight))
+        self.relation_family_similarity = max(-1.0, min(1.0, float(relation_family_similarity)))
+        self.min_relation_family_size = max(2, int(min_relation_family_size))
+        self.use_source_traversal_audit = bool(use_source_traversal_audit)
+        self.source_traversal_anchor_limit = max(0, int(source_traversal_anchor_limit))
+        self.source_traversal_rounds = max(0, int(source_traversal_rounds))
+        self.source_traversal_accepts_per_round = max(1, int(source_traversal_accepts_per_round))
+        self.source_traversal_candidate_limit = max(1, int(source_traversal_candidate_limit))
+        self.use_dependency_resolver = bool(use_dependency_resolver)
+        self.dependency_resolver_depth = max(0, int(dependency_resolver_depth))
+        self.dependency_resolver_max_frames = max(1, int(dependency_resolver_max_frames))
+        self.dependency_support_verifier = dependency_support_verifier
         self._query_plan_cache: dict[str, QueryRetrievalPlan] = {}
+        self._source_traversal_vocabulary_cache: dict[str, _SourceTraversalVocabularyCache] = {}
+        self._document_assembly_cache: dict[str, _DocumentAssemblyCache] = {}
+        self._document_language_cache: dict[str, _DocumentLanguageCache] = {}
 
     def assemble(self, document: ExtractedDocument, prompt: str) -> QueryAssemblyResult:
         pipeline = self._signal_builder.build(document)
@@ -2166,9 +2481,9 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
                 prompt=prompt,
                 plan=retrieval_plan,
             )
-        embeddings = self._embed([prompt, *[proposition.text for proposition in propositions]])
-        prompt_embedding = embeddings[0]
-        proposition_embeddings = embeddings[1:]
+        prompt_embedding = self._embed([prompt])[0]
+        document_cache = self._document_assembly_cache_for(signals=signals, propositions=propositions)
+        proposition_embeddings = document_cache.proposition_embeddings
         proposition_similarities = proposition_embeddings @ prompt_embedding
         language_scores = self._language_proposition_scores(prompt=prompt, propositions=propositions)
         core_candidates = self._top_language_proposition_core_candidates(
@@ -2181,11 +2496,26 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
             forced_anchor_groups=bridge_anchor_groups,
             forced_slots=self.query_planner_bridge_slots if retrieval_plan is not None else 0,
         )
-        graph = self._consensus_graph(
-            signals=signals,
-            propositions=propositions,
-            proposition_embeddings=proposition_embeddings,
-        )
+        dependency_packages: list[ResolvedPackage] = []
+        if self.use_dependency_resolver:
+            dependency_packages, core_candidates = self._dependency_resolver_core_candidates(
+                signals=signals,
+                propositions=propositions,
+                core_candidates=core_candidates,
+            )
+        graph = document_cache.graph
+        relation_geometry = document_cache.relation_geometry
+        answer_bundle = None
+        if retrieval_plan is not None and retrieval_plan.sub_needs:
+            answer_bundle = self._assemble_answer_bundle(
+                signals=signals,
+                propositions=propositions,
+                prompt=prompt,
+                retrieval_plan=retrieval_plan,
+                graph=graph,
+                proposition_embeddings=proposition_embeddings,
+                relation_geometry=relation_geometry,
+            )
         packages = [
             self._assemble_cluster_for_core(
                 signals=signals,
@@ -2196,6 +2526,7 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
                 proposition_similarities=proposition_similarities,
                 language_scores=language_scores,
                 graph=graph,
+                relation_geometry=relation_geometry,
                 core_candidate=core_candidate,
                 package_index=index,
             )
@@ -2208,7 +2539,2366 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
             propositions=propositions,
             retrieval_plan=retrieval_plan,
         )
-        return QueryAssemblyResult(prompt=prompt, packages=ranked, propositions=propositions, retrieval_plan=retrieval_plan)
+        source_traversals = self._audit_source_traversals(
+            signals=signals,
+            propositions=propositions,
+            prompt=prompt,
+            proposition_embeddings=proposition_embeddings,
+            proposition_similarities=proposition_similarities,
+            graph=graph,
+            relation_geometry=relation_geometry,
+            core_candidates=self._source_traversal_core_candidates_from_packages(
+                packages=ranked,
+                propositions=propositions,
+                proposition_embeddings=proposition_embeddings,
+                proposition_similarities=proposition_similarities,
+            ),
+        )
+        source_traversal_packages = self._source_traversal_packages(
+            signals=signals,
+            propositions=propositions,
+            prompt=prompt,
+            prompt_embedding=prompt_embedding,
+            proposition_embeddings=proposition_embeddings,
+            source_traversals=source_traversals,
+            retrieval_plan=retrieval_plan,
+        )
+        source_traversal_answer_bundle = self._source_traversal_answer_bundle(
+            prompt=prompt,
+            signals=signals,
+            source_traversals=source_traversals,
+            source_traversal_packages=source_traversal_packages,
+        )
+        return QueryAssemblyResult(
+            prompt=prompt,
+            packages=ranked,
+            propositions=propositions,
+            retrieval_plan=retrieval_plan,
+            dependency_packages=dependency_packages,
+            answer_bundle=answer_bundle,
+            source_traversals=source_traversals,
+            source_traversal_packages=source_traversal_packages,
+            source_traversal_answer_bundle=source_traversal_answer_bundle,
+        )
+
+    def _dependency_resolver_core_candidates(
+        self,
+        *,
+        signals: list[ElementSignalRecord],
+        propositions: list[QueryEvidenceProposition],
+        core_candidates: list[_CoreCandidate],
+    ) -> tuple[list[ResolvedPackage], list[_CoreCandidate]]:
+        term_candidates, frame_candidates = self._dependency_resolver_candidates(
+            signals=signals,
+            propositions=propositions,
+        )
+        if not frame_candidates:
+            return [], core_candidates
+
+        proposition_index_by_id = {
+            proposition.proposition_id: index
+            for index, proposition in enumerate(propositions)
+        }
+        term_index = DocumentTermIndex.from_candidates(term_candidates)
+        resolver = DependencyResolver(
+            max_depth=self.dependency_resolver_depth,
+            max_selected_frames=self.dependency_resolver_max_frames,
+            support_verifier=self.dependency_support_verifier,
+        )
+        dependency_packages: list[ResolvedPackage] = []
+        updated_candidates: list[_CoreCandidate] = []
+        for core_candidate in core_candidates:
+            if core_candidate.proposition_index is None or core_candidate.proposition_id is None:
+                updated_candidates.append(core_candidate)
+                continue
+            core_proposition = propositions[core_candidate.proposition_index]
+            package = resolver.resolve_query_propositions(
+                core=core_proposition,
+                propositions=propositions,
+                term_index=term_index,
+                frame_candidates=frame_candidates,
+            )
+            dependency_packages.append(package)
+            dependency_anchor_indices = [
+                proposition_index_by_id[frame.source.proposition_id]
+                for frame in package.selected_frames
+                if frame.source.proposition_id in proposition_index_by_id
+            ]
+            anchor_indices = tuple(
+                dict.fromkeys(
+                    [
+                        *core_candidate.anchor_prop_indices,
+                        *dependency_anchor_indices,
+                    ]
+                )
+            )
+            updated_candidates.append(replace(core_candidate, anchor_prop_indices=anchor_indices))
+        return dependency_packages, updated_candidates
+
+    def _dependency_resolver_candidates(
+        self,
+        *,
+        signals: list[ElementSignalRecord],
+        propositions: list[QueryEvidenceProposition],
+    ) -> tuple[list[TermCandidate], list[FrameCandidate]]:
+        term_candidates: list[TermCandidate] = []
+        frame_candidates: list[FrameCandidate] = []
+        signal_by_element_id = {signal.element_id: signal for signal in signals}
+        term_seeds_by_proposition: dict[str, list[_DependencyTermSeed]] = {}
+
+        for proposition in propositions:
+            for role_index, role in enumerate(proposition.roles):
+                slots: dict[str, SlotCandidate] = {}
+                for slot_name, slot_text in (("target", role.target), ("value", role.value)):
+                    text = str(slot_text or "").strip()
+                    if not text:
+                        continue
+                    term_candidates.append(
+                        TermCandidate(
+                            element_id=proposition.element_id,
+                            text=text,
+                            char_start=0,
+                            char_end=len(text),
+                            source_signal=f"proposition_role.{slot_name}",
+                        )
+                    )
+                    slots[slot_name] = SlotCandidate(
+                        name=slot_name,
+                        text=text,
+                        char_start=0,
+                        char_end=len(text),
+                        grounding_state="grounded" if slot_name == "target" else "unsupported",
+                    )
+                if not slots:
+                    continue
+                frame_candidates.append(
+                    FrameCandidate(
+                        frame_id=f"frame:{proposition.proposition_id}:role:{role_index:02d}",
+                        element_id=proposition.element_id,
+                        proposition_id=proposition.proposition_id,
+                        predicate=role.role.strip().lower() or "role",
+                        slots=slots,
+                        char_start=0,
+                        char_end=len(proposition.text),
+                        text=proposition.text,
+                        extraction_status="role_hypothesis",
+                    )
+                )
+
+            signal = signal_by_element_id.get(proposition.element_id)
+            if signal is None:
+                continue
+            seeds = self._dependency_term_seeds(signal=signal, proposition=proposition)
+            if seeds:
+                term_seeds_by_proposition[proposition.proposition_id] = seeds
+
+        document_frequencies: Counter[str] = Counter()
+        for seeds in term_seeds_by_proposition.values():
+            document_frequencies.update({normalize_term_text(seed.text) for seed in seeds if normalize_term_text(seed.text)})
+
+        seen_terms: set[tuple[str, str, int, int, str]] = set()
+        for proposition in propositions:
+            seeds = term_seeds_by_proposition.get(proposition.proposition_id, [])
+            if not seeds:
+                continue
+            selected_seeds = self._select_dependency_term_seeds(
+                seeds=seeds,
+                document_frequencies=document_frequencies,
+            )
+            for seed in selected_seeds:
+                term_key = (
+                    proposition.element_id,
+                    normalize_term_text(seed.text),
+                    seed.char_start,
+                    seed.char_end,
+                    seed.source_signal,
+                )
+                if term_key in seen_terms:
+                    continue
+                seen_terms.add(term_key)
+                term_candidates.append(
+                    TermCandidate(
+                        element_id=proposition.element_id,
+                        text=seed.text,
+                        char_start=seed.char_start,
+                        char_end=seed.char_end,
+                        source_signal=seed.source_signal,
+                        head=self._dependency_term_head(seed.text),
+                        modifiers=self._dependency_term_modifiers(seed.text),
+                    )
+                )
+            frame_candidates.extend(
+                self._document_native_frame_candidates(
+                    proposition=proposition,
+                    seeds=selected_seeds,
+                    document_frequencies=document_frequencies,
+                )
+            )
+        return term_candidates, frame_candidates
+
+    def _dependency_term_seeds(
+        self,
+        *,
+        signal: ElementSignalRecord,
+        proposition: QueryEvidenceProposition,
+    ) -> list[_DependencyTermSeed]:
+        seeds: list[_DependencyTermSeed] = []
+        seen: set[str] = set()
+
+        def add(text: str, *, source_signal: str, priority: float) -> None:
+            term_text = str(text or "").strip()
+            normalized = normalize_term_text(term_text)
+            if not normalized or normalized in seen:
+                return
+            span = self._dependency_term_span(proposition.text, term_text)
+            if span is None:
+                span = self._dependency_term_span(signal.text, term_text)
+            if span is None:
+                return
+            char_start, char_end, source_text = span
+            seen.add(normalized)
+            seeds.append(
+                _DependencyTermSeed(
+                    text=source_text,
+                    char_start=char_start,
+                    char_end=char_end,
+                    source_signal=source_signal,
+                    priority=priority,
+                )
+            )
+
+        for symbol in signal.formula_symbols:
+            add(symbol, source_signal="signal.formula_symbol", priority=3.0)
+        if signal.is_heading:
+            add(signal.text, source_signal="signal.heading_text", priority=2.5)
+        for phrase in self._dependency_phrase_seeds(signal=signal, proposition=proposition):
+            add(phrase, source_signal="signal.adjacent_content_phrase", priority=2.2)
+        for term in signal.unique_content_terms:
+            add(term, source_signal="signal.unique_content_term", priority=1.0)
+        return sorted(seeds, key=lambda seed: (seed.char_start, seed.char_end))
+
+    def _dependency_phrase_seeds(
+        self,
+        *,
+        signal: ElementSignalRecord,
+        proposition: QueryEvidenceProposition,
+    ) -> list[str]:
+        allowed = {normalize_term_text(term) for term in signal.unique_content_terms}
+        allowed.update(normalize_term_text(symbol) for symbol in signal.formula_symbols)
+        allowed.discard("")
+        if not allowed:
+            return []
+
+        matches = list(TOKEN_RE.finditer(proposition.text))
+        phrases: list[str] = []
+        run: list[re.Match[str]] = []
+
+        def flush() -> None:
+            if len(run) < 2:
+                return
+            for width in range(min(3, len(run)), 1, -1):
+                for start in range(0, len(run) - width + 1):
+                    first = run[start]
+                    last = run[start + width - 1]
+                    phrases.append(proposition.text[first.start() : last.end()])
+
+        previous_end = -1
+        for match in matches:
+            normalized = normalize_term_text(match.group(0))
+            gap_text = proposition.text[previous_end : match.start()] if previous_end >= 0 else ""
+            adjacent = previous_end < 0 or gap_text.strip() == ""
+            if normalized in allowed and adjacent:
+                run.append(match)
+            else:
+                flush()
+                run = [match] if normalized in allowed else []
+            previous_end = match.end()
+        flush()
+        return list(dict.fromkeys(phrases))
+
+    def _dependency_term_span(self, text: str, term: str) -> tuple[int, int, str] | None:
+        source = str(text or "")
+        needle = str(term or "").strip()
+        if not source or not needle:
+            return None
+        normalized_needle = normalize_term_text(needle)
+        if " " not in normalized_needle:
+            for match in TOKEN_RE.finditer(source):
+                if normalize_term_text(match.group(0)) == normalized_needle:
+                    return match.start(), match.end(), match.group(0)
+            return None
+        index = source.lower().find(needle.lower())
+        if index < 0:
+            return None
+        return index, index + len(needle), source[index : index + len(needle)]
+
+    def _select_dependency_term_seeds(
+        self,
+        *,
+        seeds: list[_DependencyTermSeed],
+        document_frequencies: Counter[str],
+    ) -> list[_DependencyTermSeed]:
+        deduped: dict[str, _DependencyTermSeed] = {}
+        for seed in seeds:
+            normalized = normalize_term_text(seed.text)
+            if not normalized:
+                continue
+            existing = deduped.get(normalized)
+            if existing is None or seed.priority > existing.priority:
+                deduped[normalized] = seed
+        ranked = sorted(
+            deduped.values(),
+            key=lambda seed: self._dependency_term_score(seed, document_frequencies=document_frequencies),
+            reverse=True,
+        )
+        return sorted(ranked[:6], key=lambda seed: (seed.char_start, seed.char_end))
+
+    def _document_native_frame_candidates(
+        self,
+        *,
+        proposition: QueryEvidenceProposition,
+        seeds: list[_DependencyTermSeed],
+        document_frequencies: Counter[str],
+    ) -> list[FrameCandidate]:
+        if len(seeds) < 2:
+            return []
+        target_candidates = [
+            seed
+            for seed in sorted(seeds, key=lambda item: (item.char_start, -item.priority))
+            if seed.priority >= 2.0
+        ]
+        target_seed = target_candidates[0] if target_candidates else sorted(seeds, key=lambda item: item.char_start)[0]
+        target_normalized = normalize_term_text(target_seed.text)
+        related = [
+            seed
+            for seed in sorted(
+                seeds,
+                key=lambda item: self._dependency_term_score(item, document_frequencies=document_frequencies),
+                reverse=True,
+            )
+            if normalize_term_text(seed.text)
+            and not self._dependency_terms_nested(target_normalized, normalize_term_text(seed.text))
+        ][:2]
+        if not related:
+            return []
+        slots: dict[str, SlotCandidate] = {
+            "target": SlotCandidate(
+                name="target",
+                text=target_seed.text,
+                char_start=target_seed.char_start,
+                char_end=target_seed.char_end,
+                grounding_state="grounded",
+            )
+        }
+        for related_index, related_seed in enumerate(related, start=1):
+            slots[f"related_{related_index}"] = SlotCandidate(
+                name=f"related_{related_index}",
+                text=related_seed.text,
+                char_start=related_seed.char_start,
+                char_end=related_seed.char_end,
+                grounding_state="unsupported",
+            )
+        return [
+            FrameCandidate(
+                frame_id=f"frame:{proposition.proposition_id}:document:00",
+                element_id=proposition.element_id,
+                proposition_id=proposition.proposition_id,
+                predicate="document_terms",
+                slots=slots,
+                char_start=0,
+                char_end=len(proposition.text),
+                text=proposition.text,
+                extraction_status="document_signal",
+            )
+        ]
+
+    def _dependency_term_score(self, seed: _DependencyTermSeed, *, document_frequencies: Counter[str]) -> float:
+        normalized = normalize_term_text(seed.text)
+        if not normalized:
+            return 0.0
+        word_count = len(normalized.split())
+        document_frequency = document_frequencies.get(normalized, 0)
+        if document_frequency <= 1:
+            frequency_score = 0.25
+        elif document_frequency <= 8:
+            frequency_score = 1.2
+        elif document_frequency <= 20:
+            frequency_score = 0.65
+        else:
+            frequency_score = 0.0
+        return seed.priority + min(1.5, max(0, word_count - 1) * 0.75) + frequency_score
+
+    def _dependency_terms_nested(self, left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        left_words = left.split()
+        right_words = right.split()
+        if len(left_words) <= len(right_words):
+            return any(right_words[index : index + len(left_words)] == left_words for index in range(len(right_words) - len(left_words) + 1))
+        return any(left_words[index : index + len(right_words)] == right_words for index in range(len(left_words) - len(right_words) + 1))
+
+    def _dependency_term_head(self, text: str) -> str:
+        parts = normalize_term_text(text).split()
+        return parts[-1] if parts else ""
+
+    def _dependency_term_modifiers(self, text: str) -> tuple[str, ...]:
+        parts = normalize_term_text(text).split()
+        return tuple(parts[:-1])
+
+    def _document_cache_key(
+        self,
+        *,
+        namespace: str,
+        signals: list[ElementSignalRecord] | None = None,
+        propositions: list["QueryEvidenceProposition"],
+        settings: tuple[object, ...] = (),
+    ) -> str:
+        hasher = hashlib.sha256()
+        hasher.update(namespace.encode("utf-8", "ignore"))
+        hasher.update(b"\0")
+        for setting in settings:
+            hasher.update(repr(setting).encode("utf-8", "ignore"))
+            hasher.update(b"\0")
+        if signals is not None:
+            for signal in signals:
+                for value in (
+                    signal.element_id,
+                    signal.element_type,
+                    signal.text,
+                    signal.page_number,
+                    signal.is_heading,
+                    signal.token_count,
+                    tuple(str(marker) for marker in signal.markers),
+                ):
+                    hasher.update(str(value).encode("utf-8", "ignore"))
+                    hasher.update(b"\0")
+                hasher.update(b"\0")
+        for proposition in propositions:
+            for value in (proposition.element_id, proposition.element_index, proposition.text):
+                hasher.update(str(value).encode("utf-8", "ignore"))
+                hasher.update(b"\0")
+            hasher.update(b"\0")
+        return hasher.hexdigest()
+
+    def _document_assembly_cache_for(
+        self,
+        *,
+        signals: list[ElementSignalRecord],
+        propositions: list["QueryEvidenceProposition"],
+    ) -> _DocumentAssemblyCache:
+        key = self._document_cache_key(
+            namespace="document-assembly",
+            signals=signals,
+            propositions=propositions,
+            settings=(
+                self._effective_k_values(len(propositions)),
+                self.min_neighbor_stability,
+                self.min_edge_similarity,
+                self.use_relation_geometry,
+                self.relation_geometry_weight,
+                self.relation_family_similarity,
+                self.min_relation_family_size,
+            ),
+        )
+        cached = self._document_assembly_cache.get(key)
+        if cached is not None:
+            return cached
+
+        proposition_embeddings = self._embed([proposition.text for proposition in propositions])
+        graph = self._consensus_graph(
+            signals=signals,
+            propositions=propositions,
+            proposition_embeddings=proposition_embeddings,
+        )
+        relation_geometry = self._document_relation_geometry(
+            signals=signals,
+            propositions=propositions,
+            proposition_embeddings=proposition_embeddings,
+            graph=graph,
+        )
+        cached = _DocumentAssemblyCache(
+            key=key,
+            proposition_embeddings=proposition_embeddings,
+            graph=graph,
+            relation_geometry=relation_geometry,
+        )
+        self._document_assembly_cache[key] = cached
+        if len(self._document_assembly_cache) > 8:
+            oldest_key = next(iter(self._document_assembly_cache))
+            if oldest_key != key:
+                self._document_assembly_cache.pop(oldest_key, None)
+        return cached
+
+    def _source_traversal_vocabulary(
+        self,
+        propositions: list["QueryEvidenceProposition"],
+    ) -> _SourceTraversalVocabularyCache:
+        hasher = hashlib.sha256()
+        for proposition in propositions:
+            hasher.update(proposition.element_id.encode("utf-8", "ignore"))
+            hasher.update(b"\0")
+            hasher.update(str(proposition.element_index).encode("ascii", "ignore"))
+            hasher.update(b"\0")
+            hasher.update(proposition.text.encode("utf-8", "ignore"))
+            hasher.update(b"\0\0")
+        key = hasher.hexdigest()
+        cached = self._source_traversal_vocabulary_cache.get(key)
+        if cached is not None:
+            return cached
+
+        units_by_index = tuple(
+            frozenset(self._source_traversal_units(proposition.text))
+            for proposition in propositions
+        )
+        claim_units_by_index = tuple(
+            frozenset(self._source_traversal_claim_units(proposition.text))
+            for proposition in propositions
+        )
+        unit_counts: Counter[str] = Counter()
+        claim_unit_counts: Counter[str] = Counter()
+        for units in units_by_index:
+            unit_counts.update(units)
+        for units in claim_units_by_index:
+            claim_unit_counts.update(units)
+
+        vocabulary = _SourceTraversalVocabularyCache(
+            key=key,
+            unit_counts=unit_counts,
+            claim_unit_counts=claim_unit_counts,
+            units_by_index=units_by_index,
+            claim_units_by_index=claim_units_by_index,
+        )
+        self._source_traversal_vocabulary_cache[key] = vocabulary
+        if len(self._source_traversal_vocabulary_cache) > 8:
+            oldest_key = next(iter(self._source_traversal_vocabulary_cache))
+            if oldest_key != key:
+                self._source_traversal_vocabulary_cache.pop(oldest_key, None)
+        return vocabulary
+
+    def _audit_source_traversals(
+        self,
+        *,
+        signals: list[ElementSignalRecord],
+        propositions: list[QueryEvidenceProposition],
+        prompt: str,
+        proposition_embeddings: np.ndarray,
+        proposition_similarities: np.ndarray,
+        graph: dict[int, dict[int, "_ConsensusEdge"]],
+        relation_geometry: "_DocumentRelationGeometry | None",
+        core_candidates: list["_CoreCandidate"],
+    ) -> list[SourceTraversalTrace]:
+        if not self.use_source_traversal_audit or not propositions or self.source_traversal_anchor_limit <= 0:
+            return []
+
+        traces: list[SourceTraversalTrace] = []
+        role_cache: dict[int, set[str]] = {}
+        prompt_units = self._source_traversal_units(prompt)
+        prompt_claim_units = self._source_traversal_claim_units(prompt)
+        prompt_claim_tokens = self._source_traversal_claim_tokens(prompt_claim_units)
+        vocabulary_cache = self._source_traversal_vocabulary(propositions)
+
+        def roles_for(index: int) -> set[str]:
+            cached = role_cache.get(index)
+            if cached is not None:
+                return cached
+            proposition = propositions[index]
+            roles = self._element_role_families(
+                signal=signals[proposition.element_index],
+                propositions=[proposition],
+            )
+            role_cache[index] = roles
+            return roles
+
+        def units_for(index: int) -> set[str]:
+            return set(vocabulary_cache.units_by_index[index])
+
+        def claim_units_for(index: int) -> set[str]:
+            return set(vocabulary_cache.claim_units_by_index[index])
+
+        document_unit_counts = vocabulary_cache.unit_counts
+        document_claim_unit_counts = vocabulary_cache.claim_unit_counts
+
+        anchors: list[int] = []
+        seen_anchor_elements: set[str] = set()
+        for candidate in core_candidates:
+            index = candidate.proposition_index
+            if index < 0 or index >= len(propositions):
+                continue
+            element_id = propositions[index].element_id
+            if element_id in seen_anchor_elements:
+                continue
+            anchors.append(index)
+            seen_anchor_elements.add(element_id)
+            if len(anchors) >= self.source_traversal_anchor_limit:
+                break
+
+        for anchor_index in anchors:
+            centers: list[dict[str, object]] = [
+                {
+                    "id": "center-0",
+                    "anchor_index": anchor_index,
+                    "accepted": [anchor_index],
+                    "accepted_set": {anchor_index},
+                    "frontier": [anchor_index],
+                    "bridge_frontier": [],
+                    "topic_terms": [],
+                }
+            ]
+            accepted = [anchor_index]
+            accepted_set = {anchor_index}
+            traversed_set = {anchor_index}
+            candidate_traces: list[SourceTraversalCandidateTrace] = []
+            dead_end_reason = ""
+
+            for round_number in range(1, self.source_traversal_rounds + 1):
+                accepted_element_ids = {propositions[index].element_id for index in accepted}
+
+                def candidate_row(center: dict[str, object], candidate_index: int, tags: set[str]) -> dict[str, object]:
+                    center_id = str(center["id"])
+                    center_accepted = list(center["accepted"])  # type: ignore[arg-type]
+                    center_anchor_index = int(center["anchor_index"])
+                    accepted_embeddings = proposition_embeddings[center_accepted]
+                    state_embedding = _normalize(np.mean(accepted_embeddings, axis=0, keepdims=True))[0]
+                    center_roles: set[str] = set().union(*(roles_for(index) for index in center_accepted))
+                    center_units: set[str] = set().union(*(units_for(index) for index in center_accepted))
+                    center_claim_units: set[str] = set().union(*(claim_units_for(index) for index in center_accepted))
+                    center_topic_terms = set(center.get("topic_terms") or [])
+                    path_signature = self._source_traversal_path_signature(
+                        accepted_indices=center_accepted,
+                        anchor_index=center_anchor_index,
+                        prompt_claim_units=prompt_claim_units,
+                        claim_units_by_index={index: claim_units_for(index) for index in center_accepted},
+                        document_claim_unit_counts=document_claim_unit_counts,
+                        document_unit_counts=document_unit_counts,
+                        document_size=len(propositions),
+                    )
+                    path_signature_tokens = self._source_traversal_claim_tokens(path_signature)
+                    candidate_embedding = proposition_embeddings[candidate_index]
+                    proposition = propositions[candidate_index]
+                    redundancy = float(np.max(proposition_embeddings[center_accepted] @ candidate_embedding))
+                    candidate_roles = roles_for(candidate_index)
+                    new_roles = candidate_roles - center_roles
+                    role_contribution = 0.0
+                    if candidate_roles:
+                        role_contribution = len(new_roles) / max(1, len(candidate_roles))
+                    geometry_score = 0.0
+                    if relation_geometry is not None:
+                        geometry_score = max(
+                            relation_geometry.score(source_index, candidate_index)
+                            for source_index in traversed_set
+                            if source_index != candidate_index
+                        )
+                    candidate_units = units_for(candidate_index)
+                    contribution = self._source_traversal_contribution(
+                        signal=signals[proposition.element_index],
+                        proposition=proposition,
+                        relation_tags=set(tags),
+                        prompt_units=prompt_units,
+                        prompt_wants_support=self._prompt_wants_support(prompt),
+                        accepted_units=center_units,
+                        candidate_units=candidate_units,
+                        document_unit_counts=document_unit_counts,
+                        document_size=len(propositions),
+                        accepted_roles=center_roles,
+                        candidate_roles=candidate_roles,
+                    )
+                    candidate_support_like = (
+                        signals[proposition.element_index].element_type in SUPPORT_ELEMENT_TYPES
+                        or proposition.text.lstrip().lower().startswith(("figure", "table", "chart", "diagram"))
+                    )
+                    candidate_claim_units = claim_units_for(candidate_index)
+                    neededness = self._source_traversal_neededness(
+                        candidate_claim_units=candidate_claim_units,
+                        accepted_claim_units=center_claim_units,
+                        path_signature=path_signature,
+                        path_signature_tokens=path_signature_tokens,
+                        prompt_claim_units=prompt_claim_units,
+                        prompt_claim_tokens=prompt_claim_tokens,
+                        relation_tags=set(tags),
+                        candidate_support_like=candidate_support_like,
+                        candidate_signal=signals[proposition.element_index],
+                        accepted_signals=[signals[propositions[index].element_index] for index in center_accepted],
+                        candidate_roles=candidate_roles,
+                        accepted_roles=center_roles,
+                        contribution_kind=str(contribution["kind"]),
+                        document_unit_counts=document_unit_counts,
+                        document_claim_unit_counts=document_claim_unit_counts,
+                        document_size=len(propositions),
+                    )
+                    topic_guard = self._source_traversal_center_topic_guard(
+                        candidate_claim_units=candidate_claim_units,
+                        prompt_claim_tokens=prompt_claim_tokens,
+                        center_topic_terms=center_topic_terms,
+                        relation_tags=set(tags),
+                    )
+                    if not topic_guard["ok"]:
+                        neededness = {
+                            **neededness,
+                            "ok": False,
+                            "reason": topic_guard["reason"],
+                        }
+                    new_center = self._source_traversal_new_center_candidate(
+                        candidate_claim_units=candidate_claim_units,
+                        path_signature_tokens=path_signature_tokens,
+                        prompt_claim_tokens=prompt_claim_tokens,
+                        relation_tags=set(tags),
+                        source_ok=bool(contribution["source_ok"]),
+                        candidate_signal=signals[proposition.element_index],
+                        center_anchor_signal=signals[propositions[center_anchor_index].element_index],
+                        candidate_roles=candidate_roles,
+                        accepted_roles=center_roles,
+                        foreign_tokens=set(neededness["foreign_tokens"]),
+                        existing_center_count=len(centers),
+                        document_unit_counts=document_unit_counts,
+                        document_size=len(propositions),
+                    )
+                    return {
+                        "index": candidate_index,
+                        "center_id": center_id,
+                        "center_decision": "existing_center",
+                        "tags": sorted(tags),
+                        "prompt": float(proposition_similarities[candidate_index]),
+                        "state": float(np.dot(candidate_embedding, state_embedding)),
+                        "novelty": _clamp01(1.0 - max(0.0, redundancy)),
+                        "redundancy": redundancy,
+                        "relation_raw": float(len(tags)) + geometry_score,
+                        "geometry": geometry_score,
+                        "role": float(role_contribution),
+                        "source_ok": contribution["source_ok"],
+                        "contribution_kind": contribution["kind"],
+                        "contribution": contribution["contribution"],
+                        "contribution_units": contribution["units"],
+                        "candidate_units": candidate_units,
+                        "candidate_claim_units": candidate_claim_units,
+                        "candidate_support_like": candidate_support_like,
+                        "neededness_ok": neededness["ok"],
+                        "neededness_reason": neededness["reason"],
+                        "matched_claim_units": neededness["matched_units"],
+                        "new_needed_units": neededness["new_needed_units"],
+                        "foreign_claim_tokens": neededness["foreign_tokens"],
+                        "frame_continuation": neededness["frame_continuation"],
+                        "new_center_ok": new_center["ok"],
+                        "new_center_reason": new_center["reason"],
+                        "new_center_terms": new_center["terms"],
+                    }
+
+                def bridge_leads_to_evidence(
+                    center: dict[str, object],
+                    candidate_index: int,
+                    depth: int = 2,
+                    seen: set[int] | None = None,
+                ) -> bool:
+                    if depth <= 0:
+                        return False
+                    if seen is None:
+                        seen = set()
+                    if candidate_index in seen:
+                        return False
+                    seen.add(candidate_index)
+                    bridge_map = self._source_traversal_candidate_map(
+                        signals=signals,
+                        propositions=propositions,
+                        graph={},
+                        relation_geometry=None,
+                        frontier=[candidate_index],
+                        accepted_set=traversed_set | seen,
+                    )
+                    for bridge_target_index, bridge_tags in bridge_map.items():
+                        if propositions[bridge_target_index].element_id in accepted_element_ids:
+                            continue
+                        bridge_target_row = candidate_row(center, bridge_target_index, bridge_tags)
+                        if bool(bridge_target_row["source_ok"]) and str(bridge_target_row["contribution_kind"] or ""):
+                            return True
+                        if self._source_traversal_bridge_allowed(
+                            row=bridge_target_row,
+                            bridge_leads_to_evidence=False,
+                        ) and bridge_leads_to_evidence(center, bridge_target_index, depth=depth - 1, seen=seen):
+                            return True
+                    return False
+
+                raw_rows: list[dict[str, object]] = []
+                for center in centers:
+                    center_relation_map: dict[int, set[str]] = defaultdict(set)
+                    evidence_frontier = [
+                        index for index in list(center["frontier"]) if index in center["accepted_set"]  # type: ignore[arg-type]
+                    ]
+                    bridge_frontier = list(center["bridge_frontier"])  # type: ignore[arg-type]
+                    if evidence_frontier:
+                        for candidate_index, tags in self._source_traversal_candidate_map(
+                            signals=signals,
+                            propositions=propositions,
+                            graph=graph,
+                            relation_geometry=relation_geometry,
+                            frontier=evidence_frontier,
+                            accepted_set=traversed_set,
+                        ).items():
+                            center_relation_map[candidate_index].update(tags)
+                    if bridge_frontier:
+                        for candidate_index, tags in self._source_traversal_candidate_map(
+                            signals=signals,
+                            propositions=propositions,
+                            graph={},
+                            relation_geometry=None,
+                            frontier=bridge_frontier,
+                            accepted_set=traversed_set,
+                        ).items():
+                            center_relation_map[candidate_index].update(tags)
+                    for candidate_index, tags in center_relation_map.items():
+                        if propositions[candidate_index].element_id in accepted_element_ids:
+                            continue
+                        raw_rows.append(candidate_row(center, candidate_index, tags))
+
+                if not raw_rows:
+                    dead_end_reason = f"round {round_number}: no source-connected neighbors outside accepted centres"
+                    break
+
+                max_relation_raw = max(float(row["relation_raw"]) for row in raw_rows) or 1.0
+                for row in raw_rows:
+                    row["relation"] = _clamp01(float(row["relation_raw"]) / max_relation_raw)
+
+                medians = {
+                    name: float(np.median([float(row[name]) for row in raw_rows]))
+                    for name in ("prompt", "state", "novelty", "redundancy", "relation", "role")
+                }
+
+                scored_rows: list[tuple[int, float, dict[str, object], str, str]] = []
+                for row in raw_rows:
+                    axes = 0
+                    if float(row["prompt"]) >= medians["prompt"]:
+                        axes += 1
+                    if float(row["state"]) >= medians["state"]:
+                        axes += 1
+                    if float(row["novelty"]) >= medians["novelty"]:
+                        axes += 1
+                    if float(row["relation"]) >= medians["relation"]:
+                        axes += 1
+                    if float(row["role"]) > 0.0 and float(row["role"]) >= medians["role"]:
+                        axes += 1
+                    redundant = float(row["redundancy"]) > medians["redundancy"] and float(row["novelty"]) < medians["novelty"]
+                    bridge_ahead = False
+                    if not str(row.get("contribution_kind") or "") and self._source_traversal_can_probe_bridge(row=row):
+                        center = next((item for item in centers if str(item["id"]) == str(row["center_id"])), centers[0])
+                        bridge_ahead = bridge_leads_to_evidence(center, int(row["index"]))
+                    action, reason = self._source_traversal_path_delta(
+                        axes=axes,
+                        redundant=redundant,
+                        row=row,
+                        medians=medians,
+                        bridge_leads_to_evidence=bridge_ahead,
+                    )
+                    sort_score = (
+                        axes * 10.0
+                        + float(row["prompt"])
+                        + float(row["state"])
+                        + float(row["relation"])
+                        + float(row["role"])
+                        + float(row["novelty"])
+                        - max(0.0, float(row["redundancy"])) * 0.25
+                    )
+                    scored_rows.append((axes, sort_score, row, action, reason))
+
+                scored_rows.sort(key=lambda item: (item[3] == "accepted", item[0], item[1]), reverse=True)
+                round_accepts: list[tuple[int, str, str, list[str]]] = []
+                round_accept_element_ids: set[str] = set()
+                round_accept_contribution_units: set[str] = set()
+                round_rejection_reasons: dict[tuple[str, int], str] = {}
+                round_new_center_terms: set[str] = set()
+                round_bridges: list[tuple[int, str]] = []
+                round_bridge_element_ids: set[str] = set()
+                for _axes, _sort_score, row, proposed_action, _reason in scored_rows:
+                    if proposed_action != "accepted":
+                        continue
+                    candidate_index = int(row["index"])
+                    proposition = propositions[candidate_index]
+                    if proposition.element_id in round_accept_element_ids:
+                        continue
+                    contribution_units = set(row.get("contribution_units") or [])
+                    new_center_terms = set(row.get("new_center_terms") or [])
+                    if bool(row.get("new_center_ok")) and new_center_terms and new_center_terms <= round_new_center_terms:
+                        round_rejection_reasons[(str(row["center_id"]), candidate_index)] = (
+                            "rejected: another new centre in this path step already covered the same prompt aspect"
+                        )
+                        continue
+                    if contribution_units and contribution_units <= round_accept_contribution_units:
+                        round_rejection_reasons[(str(row["center_id"]), candidate_index)] = (
+                            "rejected: another candidate in this path step already added the same evidence"
+                        )
+                        continue
+                    center_decision = "new_center" if bool(row.get("new_center_ok")) else "existing_center"
+                    round_accepts.append((candidate_index, str(row["center_id"]), center_decision, sorted(new_center_terms)))
+                    round_accept_element_ids.add(proposition.element_id)
+                    round_accept_contribution_units.update(contribution_units)
+                    if center_decision == "new_center":
+                        round_new_center_terms.update(new_center_terms)
+                    if len(round_accepts) >= self.source_traversal_accepts_per_round:
+                        break
+                for _axes, _sort_score, row, proposed_action, _reason in scored_rows:
+                    if proposed_action != "bridge":
+                        continue
+                    candidate_index = int(row["index"])
+                    proposition = propositions[candidate_index]
+                    if proposition.element_id in round_accept_element_ids or proposition.element_id in round_bridge_element_ids:
+                        continue
+                    round_bridges.append((candidate_index, str(row["center_id"])))
+                    round_bridge_element_ids.add(proposition.element_id)
+                    if len(round_bridges) >= self.source_traversal_accepts_per_round:
+                        break
+                round_accept_keys = {(center_id, index) for index, center_id, _decision, _terms in round_accepts}
+                round_bridge_keys = {(center_id, index) for index, center_id in round_bridges}
+
+                for _axes, _sort_score, row, action, reason in scored_rows[: self.source_traversal_candidate_limit]:
+                    candidate_index = int(row["index"])
+                    proposition = propositions[candidate_index]
+                    recorded_action = action
+                    recorded_reason = reason
+                    center_id = str(row["center_id"])
+                    center_decision = "new_center" if bool(row.get("new_center_ok")) and action == "accepted" else str(row.get("center_decision") or "existing_center")
+                    if (center_id, candidate_index) in round_rejection_reasons:
+                        recorded_action = "rejected"
+                        recorded_reason = round_rejection_reasons[(center_id, candidate_index)]
+                    elif action == "accepted" and (center_id, candidate_index) not in round_accept_keys:
+                        recorded_action = "deferred"
+                        recorded_reason = "deferred: locally useful, but stronger new elements filled this round"
+                    if action == "bridge" and (center_id, candidate_index) not in round_bridge_keys:
+                        recorded_action = "deferred"
+                        recorded_reason = "deferred: bridge-only route, but stronger bridge/evidence routes filled this round"
+                    candidate_traces.append(
+                        SourceTraversalCandidateTrace(
+                            round_number=round_number,
+                            proposition_id=proposition.proposition_id,
+                            element_id=proposition.element_id,
+                            center_id=center_id,
+                            center_decision=center_decision,
+                            relation_tags=list(row["tags"]),
+                            prompt_similarity=round(float(row["prompt"]), 4),
+                            state_similarity=round(float(row["state"]), 4),
+                            novelty_score=round(float(row["novelty"]), 4),
+                            redundancy_score=round(float(row["redundancy"]), 4),
+                            relation_score=round(float(row["relation"]), 4),
+                            role_contribution_score=round(float(row["role"]), 4),
+                            token_count=signals[proposition.element_index].token_count,
+                            action=recorded_action,
+                            reason=recorded_reason,
+                            text_preview=_preview(proposition.text, limit=220),
+                            answer_contribution=str(row["contribution"]),
+                            matched_claim_units=list(row.get("matched_claim_units") or []),
+                            new_needed_units=list(row.get("new_needed_units") or []),
+                            foreign_claim_tokens=list(row.get("foreign_claim_tokens") or []),
+                            frame_continuation=str(row.get("frame_continuation") or ""),
+                        )
+                    )
+
+                if not round_accepts:
+                    if not round_bridges:
+                        dead_end_reason = f"round {round_number}: source-connected candidates did not improve or bridge the evidence path"
+                        break
+
+                for accepted_index, center_id, center_decision, new_center_terms in round_accepts:
+                    if accepted_index in accepted_set:
+                        continue
+                    accepted.append(accepted_index)
+                    accepted_set.add(accepted_index)
+                    traversed_set.add(accepted_index)
+                    if center_decision == "new_center":
+                        centers.append(
+                            {
+                                "id": f"center-{len(centers)}",
+                                "anchor_index": accepted_index,
+                                "accepted": [accepted_index],
+                                "accepted_set": {accepted_index},
+                                "frontier": [accepted_index],
+                                "bridge_frontier": [],
+                                "topic_terms": list(new_center_terms),
+                            }
+                        )
+                        continue
+                    center = next((item for item in centers if str(item["id"]) == center_id), centers[0])
+                    center["accepted"].append(accepted_index)  # type: ignore[union-attr]
+                    center["accepted_set"].add(accepted_index)  # type: ignore[union-attr]
+                    center["frontier"] = [accepted_index]
+                    center["bridge_frontier"] = []
+                for bridge_index, center_id in round_bridges:
+                    traversed_set.add(bridge_index)
+                    center = next((item for item in centers if str(item["id"]) == center_id), centers[0])
+                    center["bridge_frontier"] = [bridge_index]
+                    if not center.get("frontier"):
+                        center["frontier"] = []
+
+            anchor = propositions[anchor_index]
+            traces.append(
+                SourceTraversalTrace(
+                    anchor_proposition_id=anchor.proposition_id,
+                    anchor_element_id=anchor.element_id,
+                    anchor_text_preview=_preview(anchor.text, limit=220),
+                    accepted_proposition_ids=[propositions[index].proposition_id for index in accepted],
+                    accepted_element_ids=list(dict.fromkeys(propositions[index].element_id for index in accepted)),
+                    centers=[
+                        {
+                            "center_id": str(center["id"]),
+                            "anchor_element_id": propositions[int(center["anchor_index"])].element_id,
+                            "topic_terms": list(center.get("topic_terms") or []),
+                            "accepted_element_ids": list(
+                                dict.fromkeys(propositions[index].element_id for index in list(center["accepted"]))  # type: ignore[arg-type]
+                            ),
+                        }
+                        for center in centers
+                    ],
+                    candidates=candidate_traces,
+                    dead_end_reason=dead_end_reason,
+                )
+            )
+        return traces
+
+    def _source_traversal_packages(
+        self,
+        *,
+        signals: list[ElementSignalRecord],
+        propositions: list[QueryEvidenceProposition],
+        prompt: str,
+        prompt_embedding: np.ndarray,
+        proposition_embeddings: np.ndarray,
+        source_traversals: list[SourceTraversalTrace],
+        retrieval_plan: QueryRetrievalPlan | None,
+    ) -> list[QueryAssembledPackage]:
+        if not source_traversals:
+            return []
+        signal_by_id = {signal.element_id: signal for signal in signals}
+        proposition_text_by_element: dict[str, str] = {}
+        proposition_indices_by_element: dict[str, list[int]] = defaultdict(list)
+        for proposition_index, proposition in enumerate(propositions):
+            proposition_text_by_element.setdefault(proposition.element_id, proposition.text)
+            proposition_indices_by_element[proposition.element_id].append(proposition_index)
+
+        packages: list[QueryAssembledPackage] = []
+        seen_element_sets: set[tuple[str, ...]] = set()
+        for trace_index, trace in enumerate(source_traversals):
+            for center_index, center in enumerate(trace.centers):
+                raw_element_ids = [str(element_id) for element_id in center.get("accepted_element_ids", [])]
+                selected = [
+                    signal_by_id[element_id]
+                    for element_id in dict.fromkeys(raw_element_ids)
+                    if element_id in signal_by_id
+                ]
+                if not selected:
+                    continue
+                selected.sort(key=lambda signal: signal.element_index)
+                if len(selected) == 1 and selected[0].is_heading and selected[0].word_count <= 5:
+                    continue
+                element_key = tuple(signal.element_id for signal in selected)
+                if element_key in seen_element_sets:
+                    continue
+                seen_element_sets.add(element_key)
+
+                anchor_element_id = str(center.get("anchor_element_id") or selected[0].element_id)
+                seed_core_signal = signal_by_id.get(anchor_element_id, selected[0])
+                final_core_signal = seed_core_signal
+                selected_prop_indices = [
+                    prop_index
+                    for signal in selected
+                    for prop_index in proposition_indices_by_element.get(signal.element_id, [])
+                    if 0 <= prop_index < len(proposition_embeddings)
+                ]
+                if selected_prop_indices:
+                    package_embedding = _normalize(np.mean(proposition_embeddings[selected_prop_indices], axis=0, keepdims=True))[0]
+                else:
+                    package_embedding = prompt_embedding
+                core_prop_indices = [
+                    prop_index
+                    for prop_index in proposition_indices_by_element.get(final_core_signal.element_id, [])
+                    if 0 <= prop_index < len(proposition_embeddings)
+                ]
+                final_core_embedding = (
+                    proposition_embeddings[core_prop_indices[0]]
+                    if core_prop_indices
+                    else package_embedding
+                )
+                role_by_id = {
+                    signal.element_id: "Traversal"
+                    for signal in selected
+                    if signal.element_id != final_core_signal.element_id
+                }
+                package_text = self._package_text(
+                    selected,
+                    core_element_id=final_core_signal.element_id,
+                    role_by_id=role_by_id,
+                )
+                package_prompt_similarity = float(np.dot(package_embedding, prompt_embedding))
+                package_core_similarity = float(np.dot(package_embedding, final_core_embedding))
+                final_core_prompt_similarity = float(np.dot(final_core_embedding, prompt_embedding))
+                token_count = sum(signal.token_count for signal in selected)
+                score = self._package_score(
+                    package_prompt_similarity=package_prompt_similarity,
+                    package_core_similarity=package_core_similarity,
+                    core_prompt_similarity=final_core_prompt_similarity,
+                    token_count=token_count,
+                )
+                score += self._answerability_bonus(
+                    signals=selected,
+                    core_element_id=final_core_signal.element_id,
+                    proposition_text=proposition_text_by_element.get(final_core_signal.element_id, ""),
+                )
+                topic_terms = [str(term) for term in center.get("topic_terms", []) if str(term).strip()]
+                decisions = [
+                    QueryAssemblyDecision(
+                        element_id=final_core_signal.element_id,
+                        direction="source_traversal",
+                        action="assembled",
+                        query_similarity=round(package_prompt_similarity, 4),
+                        core_similarity=round(package_core_similarity, 4),
+                        query_delta=0.0,
+                        core_delta=0.0,
+                        reason="source traversal centre"
+                        + (f" for prompt term(s): {', '.join(topic_terms[:4])}" if topic_terms else ""),
+                    )
+                ]
+                packages.append(
+                    QueryAssembledPackage(
+                        package_id=f"query-source-traversal-package-{len(packages):05d}",
+                        core_element_id=final_core_signal.element_id,
+                        core_index=final_core_signal.element_index,
+                        seed_core_element_id=seed_core_signal.element_id,
+                        core_prompt_similarity=round(final_core_prompt_similarity, 4),
+                        package_prompt_similarity=round(package_prompt_similarity, 4),
+                        package_core_similarity=round(package_core_similarity, 4),
+                        element_ids=[signal.element_id for signal in selected],
+                        package_text=package_text,
+                        token_count=token_count,
+                        score=round(score, 4),
+                        decisions=decisions,
+                    )
+                )
+
+        return self._rank_query_packages(
+            packages=packages,
+            prompt=prompt,
+            signals=signals,
+            propositions=propositions,
+            retrieval_plan=retrieval_plan,
+        )
+
+    def _source_traversal_answer_bundle(
+        self,
+        *,
+        prompt: str,
+        signals: list[ElementSignalRecord],
+        source_traversals: list[SourceTraversalTrace],
+        source_traversal_packages: list[QueryAssembledPackage],
+    ) -> SourceTraversalAnswerBundle | None:
+        if not source_traversals or not source_traversal_packages:
+            return None
+        signal_by_id = {signal.element_id: signal for signal in signals}
+        package_rank_by_id = {
+            package.package_id: rank
+            for rank, package in enumerate(source_traversal_packages)
+        }
+
+        packages_by_element_key: dict[tuple[str, ...], QueryAssembledPackage] = {
+            tuple(package.element_ids): package for package in source_traversal_packages
+        }
+        packages_by_element_set: dict[frozenset[str], QueryAssembledPackage] = {}
+        for package in source_traversal_packages:
+            packages_by_element_set.setdefault(frozenset(package.element_ids), package)
+
+        parts: list[SourceTraversalAnswerBundlePart] = []
+        seen_package_ids: set[str] = set()
+        for trace in source_traversals:
+            for center in trace.centers:
+                raw_element_ids = [str(element_id) for element_id in center.get("accepted_element_ids", [])]
+                evidence_element_ids = list(dict.fromkeys(element_id for element_id in raw_element_ids if element_id))
+                if not evidence_element_ids:
+                    continue
+                package = packages_by_element_key.get(tuple(evidence_element_ids))
+                if package is None:
+                    package = packages_by_element_set.get(frozenset(evidence_element_ids))
+                if package is None or package.package_id in seen_package_ids:
+                    continue
+                seen_package_ids.add(package.package_id)
+
+                topic_terms = [
+                    str(term).strip()
+                    for term in center.get("topic_terms", [])
+                    if str(term).strip()
+                ]
+                evidence_text = re.sub(r"\[[^\]]+\]\s*", " ", package.package_text)
+                claim_units = sorted(self._source_traversal_claim_units(evidence_text))
+                display_terms = topic_terms[:3] or claim_units[:3]
+                display_label = ", ".join(display_terms) if display_terms else "source evidence"
+                role = "main" if topic_terms or len(parts) == 0 else "support"
+                parts.append(
+                    SourceTraversalAnswerBundlePart(
+                        part_id=f"source-traversal-bundle-part-{len(parts) + 1:02d}",
+                        role=role,
+                        display_label=display_label,
+                        center_id=str(center.get("center_id") or ""),
+                        trace_anchor_element_id=trace.anchor_element_id,
+                        topic_terms=topic_terms,
+                        claim_units=claim_units[:12],
+                        evidence_element_ids=evidence_element_ids,
+                        package=package,
+                    )
+                )
+
+        if not parts:
+            return None
+        part_order_by_id = {part.part_id: order for order, part in enumerate(parts)}
+        topic_parts = [part for part in parts if part.topic_terms]
+        if topic_parts:
+            selected_parts: list[SourceTraversalAnswerBundlePart] = []
+            covered_evidence: set[str] = set()
+            def meaningful_evidence_ids(part: SourceTraversalAnswerBundlePart) -> set[str]:
+                evidence_ids = {
+                    element_id
+                    for element_id in part.evidence_element_ids
+                    if not (
+                        (signal := signal_by_id.get(element_id)) is not None
+                        and signal.is_heading
+                        and signal.word_count <= 5
+                    )
+                }
+                return evidence_ids or set(part.evidence_element_ids)
+
+            for part in sorted(topic_parts, key=lambda item: part_order_by_id.get(item.part_id, 10_000)):
+                evidence_ids = meaningful_evidence_ids(part)
+                if evidence_ids and evidence_ids <= covered_evidence:
+                    continue
+                selected_parts.append(part)
+                covered_evidence.update(evidence_ids)
+            for part in sorted(
+                (part for part in parts if not part.topic_terms),
+                key=lambda item: part_order_by_id.get(item.part_id, 10_000),
+            ):
+                evidence_ids = meaningful_evidence_ids(part)
+                if evidence_ids and evidence_ids <= covered_evidence:
+                    continue
+                selected_parts.append(part)
+                covered_evidence.update(evidence_ids)
+                break
+            if not selected_parts:
+                selected_parts = [parts[0]]
+        else:
+            selected_parts = [parts[0]]
+
+        reindexed_parts = [
+            replace(
+                part,
+                part_id=f"source-traversal-bundle-part-{index:02d}",
+                role="main" if part.topic_terms or index == 1 else part.role,
+            )
+            for index, part in enumerate(selected_parts, start=1)
+        ]
+        return SourceTraversalAnswerBundle(
+            bundle_id="source-traversal-answer-bundle",
+            prompt=prompt,
+            parts=reindexed_parts,
+        )
+
+    def _source_traversal_core_candidates_from_packages(
+        self,
+        *,
+        packages: list[QueryAssembledPackage],
+        propositions: list[QueryEvidenceProposition],
+        proposition_embeddings: np.ndarray,
+        proposition_similarities: np.ndarray,
+    ) -> list["_CoreCandidate"]:
+        proposition_index_by_element: dict[str, int] = {}
+        for proposition_index, proposition in enumerate(propositions):
+            proposition_index_by_element.setdefault(proposition.element_id, proposition_index)
+
+        candidates: list[_CoreCandidate] = []
+        seen_elements: set[str] = set()
+        for package in packages:
+            element_id = package.core_element_id
+            if element_id in seen_elements:
+                continue
+            proposition_index = proposition_index_by_element.get(element_id)
+            if proposition_index is None:
+                continue
+            proposition = propositions[proposition_index]
+            candidates.append(
+                _CoreCandidate(
+                    element_index=proposition.element_index,
+                    prompt_similarity=float(proposition_similarities[proposition_index]),
+                    core_embedding=proposition_embeddings[proposition_index],
+                    proposition_id=proposition.proposition_id,
+                    proposition_index=proposition_index,
+                    proposition_text=proposition.text,
+                    support_element_ids=list(proposition.support_element_ids),
+                    anchor_prop_indices=(proposition_index,),
+                )
+            )
+            seen_elements.add(element_id)
+            if len(candidates) >= self.source_traversal_anchor_limit:
+                break
+        return candidates
+
+    def _source_traversal_path_delta(
+        self,
+        *,
+        axes: int,
+        redundant: bool,
+        row: Mapping[str, object],
+        medians: Mapping[str, float],
+        bridge_leads_to_evidence: bool,
+    ) -> tuple[str, str]:
+        relation_tags = set(row.get("tags") or [])
+        contribution = str(row.get("contribution") or "")
+        contribution_kind = str(row.get("contribution_kind") or "")
+        source_ok = bool(row.get("source_ok"))
+
+        if not bool(row.get("source_ok")):
+            return "rejected", "rejected: relation is only a weak probe without enough source support"
+        if not contribution_kind:
+            if bool(row.get("neededness_ok")) and str(row.get("frame_continuation") or ""):
+                return "accepted", "accepted: " + str(row.get("neededness_reason") or "source frame continuation")
+            if self._source_traversal_bridge_allowed(row=row, bridge_leads_to_evidence=bridge_leads_to_evidence):
+                return "bridge", "bridge: crossed source structure only; not package evidence"
+            return "rejected", "rejected: connected, but adding it does not improve the evidence path"
+        if bool(row.get("new_center_ok")):
+            reason = str(row.get("new_center_reason") or "candidate starts a source-backed prompt centre")
+            return "accepted", "accepted: " + reason
+        if not bool(row.get("neededness_ok")):
+            reason = str(row.get("neededness_reason") or "does not match the current path claim")
+            return "rejected", "rejected: " + reason
+        if str(row.get("frame_continuation") or "") == "list_frame_continuation":
+            return "accepted", "accepted: " + str(row.get("neededness_reason") or "source list frame continuation")
+        if redundant:
+            return "rejected", "rejected: path after addition is mostly redundant with the path before it"
+
+        structural_relation = bool(
+            relation_tags
+            & {
+                "adjacent_previous",
+                "adjacent_next",
+                "heading_to_body",
+                "explicit_support",
+                "support_to_text",
+                "same_element",
+                "strong_list",
+                "list_run_entry",
+            }
+        )
+        if not structural_relation and axes < 2:
+            return "rejected", "rejected: contribution is not backed by enough local path evidence"
+
+        if source_ok:
+            strengths: list[str] = []
+            if float(row["prompt"]) >= medians["prompt"]:
+                strengths.append("prompt relevance")
+            if float(row["state"]) >= medians["state"]:
+                strengths.append("coheres with accepted evidence")
+            if float(row["novelty"]) >= medians["novelty"]:
+                strengths.append("adds new information")
+            if float(row["relation"]) >= medians["relation"]:
+                strengths.append("has source relation support")
+            if float(row["role"]) > 0.0 and float(row["role"]) >= medians["role"]:
+                strengths.append("adds an evidence role")
+            if contribution:
+                return "accepted", "accepted: path delta improves evidence; " + contribution
+            return "accepted", "accepted: path delta improves evidence; " + ", ".join(strengths[:3])
+        return "rejected", "rejected: weak local evidence compared with this frontier"
+
+    def _source_traversal_bridge_allowed(
+        self,
+        *,
+        row: Mapping[str, object],
+        bridge_leads_to_evidence: bool,
+    ) -> bool:
+        if not self._source_traversal_can_probe_bridge(row=row):
+            return False
+        if bridge_leads_to_evidence:
+            return True
+        candidate_units = set(row.get("candidate_units") or set())
+        return not candidate_units and float(row.get("role", 0.0)) == 0.0
+
+    def _source_traversal_can_probe_bridge(self, *, row: Mapping[str, object]) -> bool:
+        relation_tags = set(row.get("tags") or [])
+        return bool(
+            relation_tags
+            & {
+                "adjacent_previous",
+                "adjacent_next",
+                "heading_to_body",
+                "explicit_support",
+                "support_to_text",
+                "strong_list",
+                "list_run_entry",
+            }
+        )
+
+    def _source_traversal_new_center_candidate(
+        self,
+        *,
+        candidate_claim_units: set[str],
+        path_signature_tokens: set[str],
+        prompt_claim_tokens: set[str],
+        relation_tags: set[str],
+        source_ok: bool,
+        candidate_signal: ElementSignalRecord,
+        center_anchor_signal: ElementSignalRecord,
+        candidate_roles: set[str],
+        accepted_roles: set[str],
+        foreign_tokens: set[str],
+        existing_center_count: int,
+        document_unit_counts: Counter[str],
+        document_size: int,
+    ) -> dict[str, object]:
+        comparison_split = "comparison" in candidate_roles and "comparison" in accepted_roles
+        if existing_center_count >= 4 or not source_ok or not candidate_claim_units:
+            return {"ok": False, "reason": "", "terms": []}
+        structural_relation = bool(
+            relation_tags
+            & {
+                "adjacent_previous",
+                "adjacent_next",
+                "heading_to_body",
+                "explicit_support",
+                "support_to_text",
+                "same_element",
+                "strong_list",
+                "list_run_entry",
+                "relation_geometry",
+                "consensus_graph",
+            }
+        )
+        if not structural_relation:
+            return {"ok": False, "reason": "", "terms": []}
+
+        candidate_tokens = self._source_traversal_claim_tokens(candidate_claim_units)
+        prompt_overlap = candidate_tokens & prompt_claim_tokens
+        if not prompt_overlap:
+            return {"ok": False, "reason": "", "terms": []}
+
+        distinctive_limit = max(1, int(math.sqrt(max(1, document_size))))
+        distinctive_prompt_overlap = {
+            token
+            for token in prompt_overlap
+            if document_unit_counts.get(token, 0) <= distinctive_limit or len(token) >= 6
+        }
+        new_prompt_overlap = distinctive_prompt_overlap - path_signature_tokens
+        broad_anchor = center_anchor_signal.is_heading or center_anchor_signal.word_count <= 5
+        if not new_prompt_overlap and not (broad_anchor and distinctive_prompt_overlap):
+            return {"ok": False, "reason": "", "terms": []}
+        broad_support_split = broad_anchor and candidate_signal.element_type in SUPPORT_ELEMENT_TYPES
+        if not comparison_split and not broad_support_split:
+            return {"ok": False, "reason": "", "terms": []}
+        if not foreign_tokens and not comparison_split:
+            return {"ok": False, "reason": "", "terms": []}
+
+        if candidate_signal.is_heading and candidate_signal.word_count <= 5 and candidate_signal.element_type not in SUPPORT_ELEMENT_TYPES:
+            return {"ok": False, "reason": "", "terms": []}
+
+        terms = sorted(new_prompt_overlap or distinctive_prompt_overlap)
+        return {
+            "ok": True,
+            "reason": "starts a source-backed centre for prompt term(s): " + ", ".join(terms[:4]),
+            "terms": terms,
+        }
+
+    def _source_traversal_center_topic_guard(
+        self,
+        *,
+        candidate_claim_units: set[str],
+        prompt_claim_tokens: set[str],
+        center_topic_terms: set[str],
+        relation_tags: set[str],
+    ) -> dict[str, object]:
+        if not center_topic_terms:
+            return {"ok": True, "reason": ""}
+        if relation_tags & {"same_element", "explicit_support", "support_to_text"}:
+            return {"ok": True, "reason": ""}
+        candidate_prompt_terms = self._source_traversal_claim_tokens(candidate_claim_units) & prompt_claim_tokens
+        candidate_prompt_terms = {term for term in candidate_prompt_terms if not self._source_traversal_claim_token_is_generic(term)}
+        if not candidate_prompt_terms:
+            return {"ok": True, "reason": ""}
+        if candidate_prompt_terms & center_topic_terms:
+            return {"ok": True, "reason": ""}
+        return {
+            "ok": False,
+            "reason": "candidate belongs to a different prompt centre: " + ", ".join(sorted(candidate_prompt_terms)[:4]),
+        }
+
+    def _source_traversal_neededness(
+        self,
+        *,
+        candidate_claim_units: set[str],
+        accepted_claim_units: set[str],
+        path_signature: set[str],
+        path_signature_tokens: set[str],
+        prompt_claim_units: set[str],
+        prompt_claim_tokens: set[str],
+        relation_tags: set[str],
+        candidate_support_like: bool,
+        candidate_signal: ElementSignalRecord,
+        accepted_signals: list[ElementSignalRecord],
+        candidate_roles: set[str],
+        accepted_roles: set[str],
+        contribution_kind: str,
+        document_unit_counts: Counter[str],
+        document_claim_unit_counts: Counter[str],
+        document_size: int,
+    ) -> dict[str, object]:
+        if not candidate_claim_units:
+            return {
+                "ok": True,
+                "reason": "candidate has no distinctive claim units",
+                "matched_units": [],
+                "new_needed_units": [],
+                "foreign_tokens": [],
+                "frame_continuation": "",
+            }
+        if not path_signature:
+            return {
+                "ok": True,
+                "reason": "no stable path claim yet",
+                "matched_units": [],
+                "new_needed_units": sorted(candidate_claim_units)[:6],
+                "foreign_tokens": [],
+                "frame_continuation": "",
+            }
+        if relation_tags & {"same_element", "explicit_support", "support_to_text"}:
+            return {
+                "ok": True,
+                "reason": "explicitly attached to the same source object",
+                "matched_units": sorted(candidate_claim_units & (path_signature | prompt_claim_units))[:6],
+                "new_needed_units": sorted(candidate_claim_units - accepted_claim_units)[:6],
+                "foreign_tokens": [],
+                "frame_continuation": "",
+            }
+
+        distinctive_limit = max(1, int(math.sqrt(max(1, document_size))))
+        scope_units = path_signature | prompt_claim_units | accepted_claim_units
+        scope_tokens = self._source_traversal_claim_tokens(scope_units)
+        candidate_tokens = self._source_traversal_claim_tokens(candidate_claim_units)
+        exact_overlap = candidate_claim_units & scope_units
+        strong_exact = {
+            unit
+            for unit in exact_overlap
+            if self._source_traversal_claim_unit_is_strong(
+                unit,
+                document_claim_unit_counts=document_claim_unit_counts,
+                distinctive_limit=distinctive_limit,
+            )
+            and (
+                not candidate_support_like
+                or len(self._source_traversal_claim_unit_tokens(unit)) >= 2
+            )
+        }
+
+        connected_units: set[str] = set()
+        connected_extension_tokens: set[str] = set()
+        for unit in candidate_claim_units:
+            tokens = self._source_traversal_claim_unit_tokens(unit)
+            overlap = tokens & scope_tokens
+            if overlap:
+                connected_units.add(unit)
+                if unit in exact_overlap or len(overlap) >= 2:
+                    connected_extension_tokens.update(tokens)
+
+        token_overlap = candidate_tokens & scope_tokens
+        strong_token_overlap = {
+            token
+            for token in token_overlap
+            if token in prompt_claim_tokens
+            or document_unit_counts.get(token, 0) <= distinctive_limit
+            or len(token) >= 6
+        }
+        foreign = self._source_traversal_foreign_claim_tokens(
+            candidate_tokens=candidate_tokens - connected_extension_tokens,
+            path_signature_tokens=path_signature_tokens | self._source_traversal_claim_tokens(accepted_claim_units),
+            prompt_claim_tokens=prompt_claim_tokens,
+            document_unit_counts=document_unit_counts,
+            distinctive_limit=distinctive_limit,
+        )
+        frame_continuation = self._source_traversal_frame_continuation(
+            candidate_signal=candidate_signal,
+            accepted_signals=accepted_signals,
+            candidate_claim_units=candidate_claim_units,
+            scope_units=scope_units,
+            foreign_tokens=foreign,
+            relation_tags=relation_tags,
+            candidate_roles=candidate_roles,
+            accepted_roles=accepted_roles,
+        )
+        if foreign and frame_continuation["ok"] and frame_continuation["type"] == "list_frame_continuation":
+            return {
+                "ok": True,
+                "reason": str(frame_continuation["reason"]),
+                "matched_units": sorted(candidate_claim_units & (path_signature | prompt_claim_units))[:6],
+                "new_needed_units": sorted(candidate_claim_units - accepted_claim_units)[:6],
+                "foreign_tokens": sorted(foreign)[:6],
+                "frame_continuation": str(frame_continuation["type"]),
+            }
+        new_needed_units = sorted((connected_units | strong_exact) - accepted_claim_units)
+        matched_units = sorted(strong_exact | (candidate_claim_units & path_signature) | (candidate_claim_units & prompt_claim_units))
+        structural_relation = bool(
+            relation_tags
+            & {
+                "adjacent_previous",
+                "adjacent_next",
+                "heading_to_body",
+                "strong_list",
+                "list_run_entry",
+            }
+        )
+
+        strong_exact_phrase = {
+            unit
+            for unit in strong_exact
+            if len(self._source_traversal_claim_unit_tokens(unit)) >= 2
+        }
+        if strong_exact_phrase or len(strong_exact) >= 2 or (strong_exact and not foreign):
+            return {
+                "ok": True,
+                "reason": "shares path claim units: " + ", ".join(sorted(strong_exact)[:3]),
+                "matched_units": matched_units[:6],
+                "new_needed_units": new_needed_units[:6],
+                "foreign_tokens": sorted(foreign)[:6],
+                "frame_continuation": "",
+            }
+        if len(strong_token_overlap) >= 2:
+            if candidate_support_like and foreign:
+                return {
+                    "ok": False,
+                    "reason": "support object introduces a different claim path: " + ", ".join(sorted(foreign)[:5]),
+                    "matched_units": matched_units[:6],
+                    "new_needed_units": new_needed_units[:6],
+                    "foreign_tokens": sorted(foreign)[:6],
+                    "frame_continuation": "",
+                }
+            return {
+                "ok": True,
+                "reason": "shares path claim tokens: " + ", ".join(sorted(strong_token_overlap)[:4]),
+                "matched_units": matched_units[:6],
+                "new_needed_units": new_needed_units[:6],
+                "foreign_tokens": sorted(foreign)[:6],
+                "frame_continuation": "",
+            }
+        if len(strong_token_overlap) == 1 and structural_relation and not candidate_support_like and len(foreign) <= 1:
+            token = next(iter(strong_token_overlap))
+            return {
+                "ok": True,
+                "reason": "structural continuation shares path token: " + token,
+                "matched_units": matched_units[:6],
+                "new_needed_units": new_needed_units[:6],
+                "foreign_tokens": sorted(foreign)[:6],
+                "frame_continuation": "",
+            }
+        if contribution_kind in {"needed definition", "explanatory support", "source-continuity evidence"}:
+            if strong_token_overlap and len(foreign) <= 2:
+                return {
+                    "ok": True,
+                    "reason": "role contribution stays connected to the path claim",
+                    "matched_units": matched_units[:6],
+                    "new_needed_units": new_needed_units[:6],
+                    "foreign_tokens": sorted(foreign)[:6],
+                    "frame_continuation": "",
+                }
+
+        if foreign:
+            if frame_continuation["ok"]:
+                return {
+                    "ok": True,
+                    "reason": str(frame_continuation["reason"]),
+                    "matched_units": matched_units[:6],
+                    "new_needed_units": sorted(candidate_claim_units - accepted_claim_units)[:6],
+                    "foreign_tokens": sorted(foreign)[:6],
+                    "frame_continuation": str(frame_continuation["type"]),
+                }
+            return {
+                "ok": False,
+                "reason": "candidate appears to start a different claim path: " + ", ".join(sorted(foreign)[:5]),
+                "matched_units": matched_units[:6],
+                "new_needed_units": new_needed_units[:6],
+                "foreign_tokens": sorted(foreign)[:6],
+                "frame_continuation": "",
+            }
+        return {
+            "ok": False,
+            "reason": "candidate does not add needed units for the current path claim",
+            "matched_units": matched_units[:6],
+            "new_needed_units": new_needed_units[:6],
+            "foreign_tokens": [],
+            "frame_continuation": "",
+        }
+
+    def _source_traversal_frame_continuation(
+        self,
+        *,
+        candidate_signal: ElementSignalRecord,
+        accepted_signals: list[ElementSignalRecord],
+        candidate_claim_units: set[str],
+        scope_units: set[str],
+        foreign_tokens: set[str],
+        relation_tags: set[str],
+        candidate_roles: set[str],
+        accepted_roles: set[str],
+    ) -> dict[str, object]:
+        hard_relation = bool(
+            relation_tags
+            & {
+                "adjacent_previous",
+                "adjacent_next",
+                "heading_to_body",
+                "same_element",
+                "explicit_support",
+                "support_to_text",
+                "strong_list",
+                "list_run_entry",
+            }
+        )
+        if not hard_relation or not foreign_tokens:
+            return {"ok": False, "type": "", "reason": ""}
+
+        list_frame = "strong_list" in relation_tags or "list_run_entry" in relation_tags
+        role_frame = self._source_traversal_role_frame_continues(
+            candidate_roles=candidate_roles,
+            accepted_roles=accepted_roles,
+        )
+        if not list_frame and not role_frame:
+            return {"ok": False, "type": "", "reason": ""}
+
+        if not self._source_traversal_unit_flow_continues(
+            candidate_signal=candidate_signal,
+            accepted_signals=accepted_signals,
+            candidate_claim_units=candidate_claim_units,
+            scope_units=scope_units,
+            foreign_tokens=foreign_tokens,
+            list_frame=list_frame,
+        ):
+            return {"ok": False, "type": "", "reason": ""}
+
+        if list_frame:
+            return {
+                "ok": True,
+                "type": "list_frame_continuation",
+                "reason": "candidate introduces new units inside the same source list frame",
+            }
+        return {
+            "ok": True,
+            "type": "role_frame_continuation",
+            "reason": "candidate introduces new units inside a compatible definition/procedure/proof frame",
+        }
+
+    def _source_traversal_role_frame_continues(
+        self,
+        *,
+        candidate_roles: set[str],
+        accepted_roles: set[str],
+    ) -> bool:
+        if not candidate_roles or not accepted_roles:
+            return False
+        proof_roles = {"proof_setup", "proof_reason", "proof_conclusion"}
+        if candidate_roles & proof_roles and accepted_roles & (proof_roles | {"procedure", "definition"}):
+            if accepted_roles & proof_roles:
+                return True
+            if "definition" in accepted_roles and candidate_roles & {"proof_setup", "proof_reason"}:
+                return True
+            if "procedure" in accepted_roles and candidate_roles & {"proof_conclusion"}:
+                return True
+            return False
+        if "procedure" in candidate_roles and accepted_roles & {"procedure", "definition", "proof_setup", "proof_reason"}:
+            return True
+        if "definition" in candidate_roles and accepted_roles & {"definition", "procedure", "proof_setup"}:
+            return True
+        return False
+
+    def _source_traversal_unit_flow_continues(
+        self,
+        *,
+        candidate_signal: ElementSignalRecord,
+        accepted_signals: list[ElementSignalRecord],
+        candidate_claim_units: set[str],
+        scope_units: set[str],
+        foreign_tokens: set[str],
+        list_frame: bool,
+    ) -> bool:
+        scope_tokens = self._source_traversal_claim_tokens(scope_units)
+        candidate_tokens = self._source_traversal_claim_tokens(candidate_claim_units)
+        if len(candidate_tokens & scope_tokens) >= 2:
+            return True
+
+        candidate_symbols = _grounding_symbols(candidate_signal.text) | {
+            token for token in candidate_tokens if len(token) <= 4 and any(character.isalpha() for character in token)
+        }
+        scope_symbols = set().union(*(_grounding_symbols(signal.text) for signal in accepted_signals)) | {
+            token for token in scope_tokens if len(token) <= 4 and any(character.isalpha() for character in token)
+        }
+        if self._source_traversal_symbol_flow(candidate_symbols=candidate_symbols, scope_symbols=scope_symbols):
+            return True
+
+        if list_frame and candidate_signal.list_signal is not None:
+            return bool(candidate_tokens & scope_tokens or candidate_symbols or foreign_tokens)
+        return False
+
+    def _source_traversal_symbol_flow(self, *, candidate_symbols: set[str], scope_symbols: set[str]) -> bool:
+        for candidate_symbol in candidate_symbols:
+            candidate = candidate_symbol.lower()
+            if not candidate or candidate in STOPWORDS:
+                continue
+            for scope_symbol in scope_symbols:
+                scope = scope_symbol.lower()
+                if not scope or scope in STOPWORDS:
+                    continue
+                if candidate == scope:
+                    return True
+                if len(scope) >= 1 and len(candidate) >= 2 and candidate.startswith(scope):
+                    return True
+                if len(candidate) >= 1 and len(scope) >= 2 and scope.startswith(candidate):
+                    return True
+        return False
+
+    def _source_traversal_claim_alignment(
+        self,
+        *,
+        candidate_claim_units: set[str],
+        path_signature: set[str],
+        path_signature_tokens: set[str],
+        prompt_claim_tokens: set[str],
+        relation_tags: set[str],
+        candidate_support_like: bool,
+        document_unit_counts: Counter[str],
+        document_claim_unit_counts: Counter[str],
+        document_size: int,
+    ) -> dict[str, object]:
+        if not path_signature:
+            return {"ok": True, "reason": "no stable path claim yet"}
+        if relation_tags & {"same_element", "explicit_support", "support_to_text"}:
+            return {"ok": True, "reason": "explicitly attached to the same source object"}
+
+        distinctive_limit = max(1, int(math.sqrt(max(1, document_size))))
+        exact_overlap = candidate_claim_units & path_signature
+        strong_exact = {
+            unit
+            for unit in exact_overlap
+            if self._source_traversal_claim_unit_is_strong(
+                unit,
+                document_claim_unit_counts=document_claim_unit_counts,
+                distinctive_limit=distinctive_limit,
+            )
+            and (
+                not candidate_support_like
+                or len(self._source_traversal_claim_unit_tokens(unit)) >= 2
+            )
+        }
+        if strong_exact:
+            return {"ok": True, "reason": "shares path claim units: " + ", ".join(sorted(strong_exact)[:3])}
+
+        candidate_tokens = self._source_traversal_claim_tokens(candidate_claim_units)
+        token_overlap = candidate_tokens & path_signature_tokens
+        strong_token_overlap = {
+            token
+            for token in token_overlap
+            if token in prompt_claim_tokens
+            or document_unit_counts.get(token, 0) <= distinctive_limit
+            or len(token) >= 6
+        }
+        if len(strong_token_overlap) >= 2:
+            return {"ok": True, "reason": "shares path claim tokens: " + ", ".join(sorted(strong_token_overlap)[:4])}
+        if len(strong_token_overlap) == 1:
+            structural_relation = bool(
+                relation_tags
+                & {
+                    "adjacent_previous",
+                    "adjacent_next",
+                    "heading_to_body",
+                    "strong_list",
+                }
+            )
+            if structural_relation and not candidate_support_like:
+                token = next(iter(strong_token_overlap))
+                return {"ok": True, "reason": "structural continuation shares path token: " + token}
+            foreign = self._source_traversal_foreign_claim_tokens(
+                candidate_tokens=candidate_tokens,
+                path_signature_tokens=path_signature_tokens,
+                prompt_claim_tokens=prompt_claim_tokens,
+                document_unit_counts=document_unit_counts,
+                distinctive_limit=distinctive_limit,
+            )
+            if not candidate_support_like and len(foreign) <= 1:
+                token = next(iter(strong_token_overlap))
+                return {"ok": True, "reason": "shares distinctive path claim token: " + token}
+
+        foreign = self._source_traversal_foreign_claim_tokens(
+            candidate_tokens=candidate_tokens,
+            path_signature_tokens=path_signature_tokens,
+            prompt_claim_tokens=prompt_claim_tokens,
+            document_unit_counts=document_unit_counts,
+            distinctive_limit=distinctive_limit,
+        )
+        if foreign:
+            return {
+                "ok": False,
+                "reason": "candidate appears to start a different claim path: " + ", ".join(sorted(foreign)[:5]),
+            }
+        return {"ok": False, "reason": "candidate does not share the current path claim"}
+
+    def _source_traversal_path_signature(
+        self,
+        *,
+        accepted_indices: list[int],
+        anchor_index: int,
+        prompt_claim_units: set[str],
+        claim_units_by_index: Mapping[int, set[str]],
+        document_claim_unit_counts: Counter[str],
+        document_unit_counts: Counter[str],
+        document_size: int,
+    ) -> set[str]:
+        if not accepted_indices:
+            return set()
+        distinctive_limit = max(1, int(math.sqrt(max(1, document_size))))
+        prompt_tokens = self._source_traversal_claim_tokens(prompt_claim_units)
+        anchor_units = claim_units_by_index.get(anchor_index, set())
+        accepted_presence: Counter[str] = Counter()
+        for units in claim_units_by_index.values():
+            accepted_presence.update(units)
+
+        signature: set[str] = set()
+        for unit, presence_count in accepted_presence.items():
+            if self._source_traversal_claim_unit_is_generic(unit):
+                continue
+            tokens = self._source_traversal_claim_unit_tokens(unit)
+            if not tokens:
+                continue
+            token_prompt_overlap = tokens & prompt_tokens
+            has_distinctive_token = any(document_unit_counts.get(token, 0) <= distinctive_limit for token in tokens)
+            phrase_like = len(tokens) >= 2
+            exact_prompt_match = unit in prompt_claim_units
+            anchor_match = unit in anchor_units
+
+            if exact_prompt_match:
+                signature.add(unit)
+            elif token_prompt_overlap and (phrase_like or has_distinctive_token):
+                signature.add(unit)
+            elif anchor_match and has_distinctive_token:
+                signature.add(unit)
+            elif presence_count > 1 and (phrase_like or has_distinctive_token):
+                signature.add(unit)
+
+        return signature
+
+    def _source_traversal_claim_units(self, text: str) -> set[str]:
+        units = {
+            unit
+            for unit in self._source_traversal_units(text)
+            if not self._source_traversal_claim_unit_is_generic(unit)
+        }
+        for language_unit in _extract_language_units(text, proposition_index=-1, element_id="", element_index=-1):
+            if language_unit.kind not in {"phrase", "relation", "quantity", "summary", "symbol"}:
+                continue
+            normalized = language_unit.normalized
+            if normalized and not self._source_traversal_claim_unit_is_generic(normalized):
+                units.add(normalized)
+        return units
+
+    def _source_traversal_claim_tokens(self, units: Iterable[str]) -> set[str]:
+        tokens: set[str] = set()
+        for unit in units:
+            tokens.update(self._source_traversal_claim_unit_tokens(unit))
+        return tokens
+
+    def _source_traversal_claim_unit_tokens(self, unit: str) -> set[str]:
+        tokens = set(_content_tokens(unit))
+        return {
+            token
+            for token in tokens
+            if not self._source_traversal_claim_token_is_generic(token)
+        }
+
+    def _source_traversal_claim_unit_is_generic(self, unit: str) -> bool:
+        tokens = set(_content_tokens(unit))
+        if not tokens:
+            return True
+        return all(self._source_traversal_claim_token_is_generic(token) for token in tokens)
+
+    def _source_traversal_claim_token_is_generic(self, token: str) -> bool:
+        if not token:
+            return True
+        if token in STOPWORDS or token in COMPLETION_NOISE_TERMS or token in VAGUE_ROLE_TARGETS:
+            return True
+        if token in SOURCE_TRAVERSAL_GENERIC_CLAIM_UNITS:
+            return True
+        if len(token) == 1 and token.isalpha():
+            return True
+        return False
+
+    def _source_traversal_claim_unit_is_strong(
+        self,
+        unit: str,
+        *,
+        document_claim_unit_counts: Counter[str],
+        distinctive_limit: int,
+    ) -> bool:
+        tokens = self._source_traversal_claim_unit_tokens(unit)
+        if len(tokens) >= 2:
+            return True
+        return bool(tokens) and document_claim_unit_counts.get(unit, 0) <= distinctive_limit
+
+    def _source_traversal_foreign_claim_tokens(
+        self,
+        *,
+        candidate_tokens: set[str],
+        path_signature_tokens: set[str],
+        prompt_claim_tokens: set[str],
+        document_unit_counts: Counter[str],
+        distinctive_limit: int,
+    ) -> set[str]:
+        foreign: set[str] = set()
+        for token in candidate_tokens - path_signature_tokens - prompt_claim_tokens:
+            if self._source_traversal_claim_token_is_generic(token):
+                continue
+            if document_unit_counts.get(token, 0) <= distinctive_limit or len(token) >= 6:
+                foreign.add(token)
+        return foreign
+
+    def _source_traversal_contribution(
+        self,
+        *,
+        signal: ElementSignalRecord,
+        proposition: QueryEvidenceProposition,
+        relation_tags: set[str],
+        prompt_units: set[str],
+        prompt_wants_support: bool,
+        accepted_units: set[str],
+        candidate_units: set[str],
+        document_unit_counts: Counter[str],
+        document_size: int,
+        accepted_roles: set[str],
+        candidate_roles: set[str],
+    ) -> dict[str, object]:
+        strong_relation_tags = {
+            "consensus_graph",
+            "adjacent_previous",
+            "adjacent_next",
+            "heading_to_body",
+            "explicit_support",
+            "support_to_text",
+            "same_element",
+            "strong_list",
+            "list_run_entry",
+        }
+        source_ok = bool(relation_tags & strong_relation_tags)
+        if not source_ok and {"shared_symbols", "same_section"} <= relation_tags:
+            source_ok = True
+        if not source_ok and "relation_geometry" in relation_tags and "same_section" in relation_tags:
+            source_ok = True
+
+        new_units = candidate_units - accepted_units
+        prompt_overlap = candidate_units & prompt_units
+        accepted_overlap = candidate_units & accepted_units
+        new_roles = candidate_roles - accepted_roles
+        prompt_substantial = self._source_traversal_overlap_is_substantial(
+            prompt_overlap,
+            document_unit_counts=document_unit_counts,
+            document_size=document_size,
+        )
+        accepted_substantial = self._source_traversal_overlap_is_substantial(
+            accepted_overlap,
+            document_unit_counts=document_unit_counts,
+            document_size=document_size,
+        )
+        prompt_symbol_overlap = any(self._source_traversal_symbollike(unit) for unit in prompt_overlap)
+        accepted_symbol_overlap = any(self._source_traversal_symbollike(unit) for unit in accepted_overlap)
+        contribution_units = sorted(
+            new_units & (prompt_units | accepted_units | _grounding_symbols(proposition.text))
+        )
+        if not contribution_units:
+            contribution_units = sorted(new_units)[:6]
+
+        if not source_ok:
+            return {"source_ok": False, "kind": "", "contribution": "", "units": contribution_units}
+        if not new_units and not new_roles:
+            return {"source_ok": True, "kind": "", "contribution": "", "units": contribution_units}
+
+        kind = ""
+        if prompt_substantial and new_units:
+            kind = "direct prompt evidence"
+        elif "definition" in candidate_roles and (prompt_substantial or accepted_substantial or prompt_symbol_overlap) and new_units:
+            kind = "needed definition"
+        elif candidate_roles & {"proof_reason", "proof_conclusion", "procedure", "comparison"} and (
+            prompt_substantial or accepted_substantial or accepted_symbol_overlap
+        ):
+            kind = "explanatory support"
+        elif (
+            "support" in candidate_roles
+            and prompt_wants_support
+            and prompt_substantial
+            and new_units
+        ):
+            kind = "visual/table support"
+        elif (
+            relation_tags & (strong_relation_tags - {"consensus_graph"})
+            and accepted_substantial
+            and new_units
+            and not signal.is_heading
+            and signal.element_type not in SUPPORT_ELEMENT_TYPES
+        ):
+            kind = "source-continuity evidence"
+
+        if not kind:
+            return {"source_ok": True, "kind": "", "contribution": "", "units": contribution_units}
+
+        unit_text = ", ".join(contribution_units[:5])
+        if unit_text:
+            contribution = f"adds {kind}: {unit_text}"
+        else:
+            contribution = f"adds {kind}"
+        return {
+            "source_ok": True,
+            "kind": kind,
+            "contribution": contribution,
+            "units": contribution_units,
+        }
+
+    def _source_traversal_units(self, text: str) -> set[str]:
+        units = {
+            token
+            for token in _content_tokens(text)
+            if token not in COMPLETION_NOISE_TERMS and token not in VAGUE_ROLE_TARGETS
+        }
+        units.update(
+            symbol
+            for symbol in _grounding_symbols(text)
+            if symbol not in COMPLETION_NOISE_TERMS and symbol not in VAGUE_ROLE_TARGETS
+        )
+        for unit in _extract_language_units(text, proposition_index=-1, element_id="", element_index=-1):
+            if unit.kind in {"symbol", "quantity", "relation"}:
+                units.update(
+                    token
+                    for token in unit.tokens
+                    if token not in COMPLETION_NOISE_TERMS and token not in VAGUE_ROLE_TARGETS
+                )
+        return units
+
+    def _source_traversal_overlap_is_substantial(
+        self,
+        units: set[str],
+        *,
+        document_unit_counts: Counter[str],
+        document_size: int,
+    ) -> bool:
+        strong_units = {
+            unit
+            for unit in units
+            if len(unit) >= 4
+            or any(character.isdigit() for character in unit)
+            or "_" in unit
+            or "(" in unit
+            or unit in {"dna", "rna", "omega", "delta"}
+        }
+        if len(strong_units) >= 2:
+            return True
+        distinctive_limit = max(1, int(math.sqrt(max(1, document_size))))
+        return any(document_unit_counts.get(unit, 0) <= distinctive_limit for unit in strong_units)
+
+    def _source_traversal_symbollike(self, unit: str) -> bool:
+        return (
+            len(unit) <= 2
+            or any(character.isdigit() for character in unit)
+            or "_" in unit
+            or "(" in unit
+            or unit in {"omega", "delta"}
+        )
+
+    def _source_traversal_candidate_map(
+        self,
+        *,
+        signals: list[ElementSignalRecord],
+        propositions: list[QueryEvidenceProposition],
+        graph: dict[int, dict[int, "_ConsensusEdge"]],
+        relation_geometry: "_DocumentRelationGeometry | None",
+        frontier: list[int],
+        accepted_set: set[int],
+    ) -> dict[int, set[str]]:
+        prop_indices_by_element: dict[str, list[int]] = defaultdict(list)
+        prop_indices_by_element_index: dict[int, list[int]] = defaultdict(list)
+        heading_keys_by_index: dict[int, set[str]] = {}
+        symbols_by_index: dict[int, set[str]] = {}
+        for proposition_index, proposition in enumerate(propositions):
+            prop_indices_by_element[proposition.element_id].append(proposition_index)
+            prop_indices_by_element_index[proposition.element_index].append(proposition_index)
+            signal = signals[proposition.element_index]
+            heading_keys_by_index[proposition_index] = {
+                heading.element_id
+                for heading in signal.heading_path
+                if heading.element_id
+            }
+            symbols_by_index[proposition_index] = _grounding_symbols(proposition.text)
+
+        relation_map: dict[int, set[str]] = defaultdict(set)
+
+        def add(target_index: int, tag: str) -> None:
+            if target_index < 0 or target_index >= len(propositions):
+                return
+            if target_index in accepted_set:
+                return
+            relation_map[target_index].add(tag)
+
+        for source_index in frontier:
+            source = propositions[source_index]
+            source_signal = signals[source.element_index]
+
+            for target_index in graph.get(source_index, {}):
+                add(target_index, "consensus_graph")
+
+            for target_index in prop_indices_by_element.get(source.element_id, []):
+                add(target_index, "same_element")
+
+            for neighbor_element_index, tag in (
+                (source.element_index - 1, "adjacent_previous"),
+                (source.element_index + 1, "adjacent_next"),
+            ):
+                for target_index in prop_indices_by_element_index.get(neighbor_element_index, []):
+                    add(target_index, tag)
+
+            if source_signal.is_heading:
+                for offset in range(1, 4):
+                    for target_index in prop_indices_by_element_index.get(source.element_index + offset, []):
+                        target_signal = signals[propositions[target_index].element_index]
+                        if target_signal.is_heading:
+                            break
+                        add(target_index, "heading_to_body")
+
+            source_heading_keys = heading_keys_by_index.get(source_index, set())
+
+            for support_id in source.support_element_ids:
+                for target_index in prop_indices_by_element.get(support_id, []):
+                    add(target_index, "explicit_support")
+            for target_index, candidate in enumerate(propositions):
+                if source.element_id in candidate.support_element_ids:
+                    add(target_index, "support_to_text")
+
+            for neighbor_element_index in range(max(0, source.element_index - 3), min(len(signals), source.element_index + 4)):
+                if neighbor_element_index == source.element_index:
+                    continue
+                if self._strong_list_sibling_pair(source_signal, signals[neighbor_element_index]):
+                    for target_index in prop_indices_by_element_index.get(neighbor_element_index, []):
+                        add(target_index, "strong_list")
+
+            if source_signal.list_signal is None:
+                list_neighbor_indices = list(
+                    range(max(0, source.element_index - 4), source.element_index)
+                ) + list(
+                    range(source.element_index + 1, min(len(signals), source.element_index + 5))
+                )
+                for neighbor_element_index in list_neighbor_indices:
+                    target_signal = signals[neighbor_element_index]
+                    if target_signal.is_heading:
+                        continue
+                    if target_signal.list_signal is None:
+                        continue
+                    if not self._same_heading_neighborhood(source_signal, target_signal):
+                        continue
+                    for target_index in prop_indices_by_element_index.get(neighbor_element_index, []):
+                        add(target_index, "list_run_entry")
+
+            source_symbols = symbols_by_index.get(source_index, set())
+            if source_symbols:
+                for target_index, target_symbols in symbols_by_index.items():
+                    if target_index == source_index:
+                        continue
+                    if source_symbols & target_symbols:
+                        add(target_index, "shared_symbols")
+
+            if relation_geometry is not None:
+                scored = [
+                    (relation_geometry.score(source_index, target_index), target_index)
+                    for target_index in range(len(propositions))
+                    if target_index not in accepted_set and target_index != source_index
+                ]
+                for score, target_index in sorted(scored, reverse=True)[: self.source_traversal_candidate_limit]:
+                    if score > 0.0:
+                        add(target_index, "relation_geometry")
+
+            if source_heading_keys:
+                for target_index in list(relation_map):
+                    target_heading_keys = heading_keys_by_index.get(target_index, set())
+                    if source_heading_keys & target_heading_keys:
+                        relation_map[target_index].add("same_section")
+
+        return dict(relation_map)
+
+    def _assemble_answer_bundle(
+        self,
+        *,
+        signals: list[ElementSignalRecord],
+        propositions: list[QueryEvidenceProposition],
+        prompt: str,
+        retrieval_plan: QueryRetrievalPlan,
+        graph: dict[int, dict[int, "_ConsensusEdge"]],
+        proposition_embeddings: np.ndarray,
+        relation_geometry: "_DocumentRelationGeometry | None",
+    ) -> QueryAnswerBundle | None:
+        if not retrieval_plan.sub_needs:
+            return None
+
+        proposition_token_sets = [self._bridge_tokens(proposition.text) for proposition in propositions]
+        token_counts: Counter[str] = Counter()
+        for tokens in proposition_token_sets:
+            token_counts.update(tokens)
+
+        parts: list[QueryAnswerBundlePart] = []
+        for sub_need_index, sub_need in enumerate(retrieval_plan.sub_needs):
+            anchor_group = self._sub_need_anchor_group(
+                signals=signals,
+                propositions=propositions,
+                proposition_token_sets=proposition_token_sets,
+                token_counts=token_counts,
+                sub_need=sub_need,
+            )
+            if not anchor_group:
+                continue
+
+            representative = anchor_group[0]
+            sub_need_query = self._sub_need_query_text(sub_need)
+            sub_need_embeddings = self._embed([sub_need_query, *[proposition.text for proposition in propositions]])
+            sub_need_prompt_embedding = sub_need_embeddings[0]
+            sub_need_similarities = sub_need_embeddings[1:] @ sub_need_prompt_embedding
+            language_scores = self._language_proposition_scores(
+                prompt=sub_need_query,
+                propositions=propositions,
+            )
+            representative_proposition = propositions[representative]
+            package = self._assemble_cluster_for_core(
+                signals=signals,
+                propositions=propositions,
+                prompt=sub_need_query,
+                prompt_embedding=sub_need_prompt_embedding,
+                proposition_embeddings=proposition_embeddings,
+                proposition_similarities=sub_need_similarities,
+                language_scores=language_scores,
+                graph=graph,
+                relation_geometry=relation_geometry,
+                core_candidate=_CoreCandidate(
+                    element_index=representative_proposition.element_index,
+                    prompt_similarity=float(sub_need_similarities[representative]),
+                    core_embedding=proposition_embeddings[representative],
+                    proposition_id=representative_proposition.proposition_id,
+                    proposition_index=representative,
+                    proposition_text=representative_proposition.text,
+                    support_element_ids=list(representative_proposition.support_element_ids),
+                    anchor_prop_indices=anchor_group,
+                ),
+                package_index=sub_need_index,
+            )
+            package = replace(package, package_id=f"query-bundle-package-{sub_need_index:05d}")
+            parts.append(
+                QueryAnswerBundlePart(
+                    sub_need=sub_need.need,
+                    search_terms=list(sub_need.search_terms),
+                    expected_roles=list(sub_need.expected_roles),
+                    package=package,
+                )
+            )
+
+        if not parts:
+            return None
+        return QueryAnswerBundle(
+            bundle_id="query-answer-bundle-00000",
+            prompt=prompt,
+            parts=parts,
+        )
 
     def _query_retrieval_plan(
         self,
@@ -2377,27 +5067,15 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
         groups: list[tuple[int, ...]] = []
         seen_groups: set[tuple[int, ...]] = set()
         for sub_need in plan.sub_needs[:4]:
-            sub_tokens = self._bridge_tokens(" ".join([sub_need.need, *sub_need.search_terms]))
-            if not sub_tokens:
+            group = self._sub_need_anchor_group(
+                signals=signals,
+                propositions=propositions,
+                proposition_token_sets=proposition_token_sets,
+                token_counts=token_counts,
+                sub_need=sub_need,
+            )
+            if not group:
                 continue
-            expected_roles = {role.strip().lower() for role in sub_need.expected_roles if role.strip()}
-            scored: list[tuple[float, int]] = []
-            for proposition_index, proposition in enumerate(propositions):
-                signal = signals[proposition.element_index]
-                if signal.is_heading:
-                    continue
-                tokens = proposition_token_sets[proposition_index]
-                overlap = tokens & sub_tokens
-                if not overlap:
-                    continue
-                rare_overlap = sum(1.0 / math.sqrt(max(1, token_counts[token])) for token in overlap)
-                role_bonus = self._sub_need_role_bonus(proposition=proposition, expected_roles=expected_roles)
-                structure_bonus = self._sub_need_structure_bonus(signal=signal, proposition=proposition, sub_need=sub_need)
-                scored.append((rare_overlap + role_bonus + structure_bonus, proposition_index))
-            ranked = [index for _score, index in sorted(scored, reverse=True)[:3]]
-            if not ranked:
-                continue
-            group = tuple(dict.fromkeys(ranked))
             if group in seen_groups:
                 continue
             seen_groups.add(group)
@@ -2412,6 +5090,39 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
                 groups.insert(0, combined)
                 groups = groups[:max_groups]
         return groups
+
+    def _sub_need_anchor_group(
+        self,
+        *,
+        signals: list[ElementSignalRecord],
+        propositions: list[QueryEvidenceProposition],
+        proposition_token_sets: list[set[str]],
+        token_counts: Counter[str],
+        sub_need: QueryRetrievalSubNeed,
+    ) -> tuple[int, ...]:
+        sub_tokens = self._bridge_tokens(" ".join([sub_need.need, *sub_need.search_terms]))
+        if not sub_tokens:
+            return ()
+        expected_roles = {role.strip().lower() for role in sub_need.expected_roles if role.strip()}
+        scored: list[tuple[float, int]] = []
+        for proposition_index, proposition in enumerate(propositions):
+            signal = signals[proposition.element_index]
+            if signal.is_heading:
+                continue
+            tokens = proposition_token_sets[proposition_index]
+            overlap = tokens & sub_tokens
+            if not overlap:
+                continue
+            rare_overlap = sum(1.0 / math.sqrt(max(1, token_counts[token])) for token in overlap)
+            role_bonus = self._sub_need_role_bonus(proposition=proposition, expected_roles=expected_roles)
+            structure_bonus = self._sub_need_structure_bonus(signal=signal, proposition=proposition, sub_need=sub_need)
+            scored.append((rare_overlap + role_bonus + structure_bonus, proposition_index))
+        ranked = [index for _score, index in sorted(scored, reverse=True)[:3]]
+        return tuple(dict.fromkeys(ranked))
+
+    def _sub_need_query_text(self, sub_need: QueryRetrievalSubNeed) -> str:
+        text = " ".join([sub_need.need, *sub_need.search_terms, *sub_need.expected_roles])
+        return re.sub(r"\s+", " ", text).strip() or sub_need.need
 
     def _combined_sub_need_representative(
         self,
@@ -2728,6 +5439,7 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
         proposition_similarities: np.ndarray,
         language_scores: np.ndarray,
         graph: dict[int, dict[int, "_ConsensusEdge"]],
+        relation_geometry: "_DocumentRelationGeometry | None",
         core_candidate: _CoreCandidate,
         package_index: int,
     ) -> QueryAssembledPackage:
@@ -2757,6 +5469,7 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
                     language_score=float(language_scores[prop_index]) if len(language_scores) else 0.0,
                     edge=graph.get(core_prop_index, {}).get(prop_index),
                     prompt_wants_support=prompt_wants_support,
+                    relation_geometry=relation_geometry,
                 ),
                 prop_index,
             )
@@ -2842,24 +5555,32 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
             if signal.element_id != signals[core_index].element_id and signal.element_id not in before_completion_ids:
                 role_by_id[signal.element_id] = "Completion"
 
+        final_core_signal, final_core_embedding = self._select_final_core(
+            selected,
+            seed_core_element_id=signals[core_index].element_id,
+            propositions=propositions,
+        )
+        if final_core_signal.element_id != signals[core_index].element_id:
+            role_by_id.setdefault(signals[core_index].element_id, "Cluster")
         package_text = self._package_text(
             selected,
-            core_element_id=signals[core_index].element_id,
+            core_element_id=final_core_signal.element_id,
             role_by_id=role_by_id,
         )
         package_embedding = self._embed([package_text])[0]
         package_prompt_similarity = float(np.dot(package_embedding, prompt_embedding))
-        package_core_similarity = float(np.dot(package_embedding, proposition_embeddings[core_prop_index]))
+        package_core_similarity = float(np.dot(package_embedding, final_core_embedding))
+        final_core_prompt_similarity = float(np.dot(final_core_embedding, prompt_embedding))
         final_token_count = sum(signal.token_count for signal in selected)
         score = self._package_score(
             package_prompt_similarity=package_prompt_similarity,
             package_core_similarity=package_core_similarity,
-            core_prompt_similarity=core_candidate.prompt_similarity,
+            core_prompt_similarity=final_core_prompt_similarity,
             token_count=final_token_count,
         )
         score += self._answerability_bonus(
             signals=selected,
-            core_element_id=signals[core_index].element_id,
+            core_element_id=final_core_signal.element_id,
             proposition_text=core_candidate.proposition_text,
         )
         if len(language_scores):
@@ -2867,9 +5588,10 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
         score += min(0.08, 0.015 * sum(1 for decision in decisions if decision.action == "attached"))
         return QueryAssembledPackage(
             package_id=f"query-cluster-package-{package_index:05d}",
-            core_element_id=signals[core_index].element_id,
-            core_index=core_index,
-            core_prompt_similarity=round(core_candidate.prompt_similarity, 4),
+            core_element_id=final_core_signal.element_id,
+            core_index=final_core_signal.element_index,
+            seed_core_element_id=signals[core_index].element_id,
+            core_prompt_similarity=round(final_core_prompt_similarity, 4),
             package_prompt_similarity=round(package_prompt_similarity, 4),
             package_core_similarity=round(package_core_similarity, 4),
             element_ids=[signal.element_id for signal in selected],
@@ -4018,6 +6740,175 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
             role_keys=frozenset(role_keys),
         )
 
+    def _document_relation_geometry(
+        self,
+        *,
+        signals: list[ElementSignalRecord],
+        propositions: list[QueryEvidenceProposition],
+        proposition_embeddings: np.ndarray,
+        graph: dict[int, dict[int, "_ConsensusEdge"]],
+    ) -> "_DocumentRelationGeometry | None":
+        if not self.use_relation_geometry or self.relation_geometry_weight <= 0.0 or len(propositions) < 2:
+            return None
+        seeds = self._document_relation_seed_pairs(signals=signals, propositions=propositions, graph=graph)
+        if len(seeds) < self.min_relation_family_size:
+            return _DocumentRelationGeometry.empty(
+                proposition_embeddings=proposition_embeddings,
+                relation_family_similarity=self.relation_family_similarity,
+            )
+        families = self._document_relation_families(
+            seeds=seeds,
+            proposition_embeddings=proposition_embeddings,
+        )
+        return _DocumentRelationGeometry(
+            proposition_embeddings=proposition_embeddings,
+            families=families,
+            relation_family_similarity=self.relation_family_similarity,
+        )
+
+    def _document_relation_seed_pairs(
+        self,
+        *,
+        signals: list[ElementSignalRecord],
+        propositions: list[QueryEvidenceProposition],
+        graph: dict[int, dict[int, "_ConsensusEdge"]],
+    ) -> list["_RelationSeed"]:
+        prop_indices_by_element: dict[str, list[int]] = defaultdict(list)
+        for proposition_index, proposition in enumerate(propositions):
+            prop_indices_by_element[proposition.element_id].append(proposition_index)
+
+        seeds: dict[tuple[int, int], set[str]] = {}
+
+        def add(source: int, target: int, tag: str) -> None:
+            if source == target:
+                return
+            if source < 0 or target < 0 or source >= len(propositions) or target >= len(propositions):
+                return
+            seeds.setdefault((source, target), set()).add(tag)
+
+        for source, neighbors in graph.items():
+            for target in neighbors:
+                add(source, target, "consensus_graph")
+
+        for indices in prop_indices_by_element.values():
+            if len(indices) <= 1:
+                continue
+            for source in indices:
+                for target in indices:
+                    add(source, target, "same_element")
+
+        by_element_index: dict[int, list[int]] = defaultdict(list)
+        for proposition_index, proposition in enumerate(propositions):
+            by_element_index[proposition.element_index].append(proposition_index)
+
+        for left_index in range(max(0, len(signals) - 1)):
+            right_index = left_index + 1
+            left = signals[left_index]
+            right = signals[right_index]
+            if left.page_number != right.page_number:
+                continue
+            for source in by_element_index.get(left_index, []):
+                for target in by_element_index.get(right_index, []):
+                    add(source, target, "adjacent_forward")
+                    add(target, source, "adjacent_backward")
+                    if left.is_heading and not right.is_heading:
+                        add(source, target, "heading_to_body")
+
+        for source_index, source in enumerate(propositions):
+            for support_id in source.support_element_ids:
+                for target_index in prop_indices_by_element.get(support_id, []):
+                    add(source_index, target_index, "explicit_support")
+                    add(target_index, source_index, "support_to_text")
+
+        for left_index, left in enumerate(signals):
+            for right_index in range(left_index + 1, min(len(signals), left_index + 4)):
+                right = signals[right_index]
+                if not self._strong_list_sibling_pair(left, right):
+                    continue
+                for source in by_element_index.get(left_index, []):
+                    for target in by_element_index.get(right_index, []):
+                        add(source, target, "strong_list")
+                        add(target, source, "strong_list")
+
+        return [
+            _RelationSeed(source_index=source, target_index=target, tags=tuple(sorted(tags)))
+            for (source, target), tags in seeds.items()
+        ]
+
+    def _strong_list_sibling_pair(self, left: ElementSignalRecord, right: ElementSignalRecord) -> bool:
+        if left.list_signal is None or right.list_signal is None:
+            return False
+        if left.list_signal.run_id is None or left.list_signal.run_id != right.list_signal.run_id:
+            return False
+        if left.list_signal.marker_type != right.list_signal.marker_type:
+            return False
+        if left.page_number != right.page_number:
+            return False
+        if abs(float(left.list_signal.indent) - float(right.list_signal.indent)) > 8.0:
+            return False
+        return abs(left.element_index - right.element_index) <= 3
+
+    def _same_heading_neighborhood(self, left: ElementSignalRecord, right: ElementSignalRecord) -> bool:
+        if left.page_number != right.page_number:
+            return False
+        left_headings = {heading.element_id for heading in left.heading_path if heading.element_id}
+        right_headings = {heading.element_id for heading in right.heading_path if heading.element_id}
+        if not left_headings and not right_headings:
+            return abs(left.element_index - right.element_index) <= 4
+        return bool(left_headings & right_headings)
+
+    def _document_relation_families(
+        self,
+        *,
+        seeds: list["_RelationSeed"],
+        proposition_embeddings: np.ndarray,
+    ) -> list["_RelationFamily"]:
+        seed_vectors: list[tuple[_RelationSeed, np.ndarray]] = []
+        for seed in seeds:
+            direction = _relation_delta_direction(
+                proposition_embeddings,
+                source_index=seed.source_index,
+                target_index=seed.target_index,
+            )
+            if direction is not None:
+                seed_vectors.append((seed, direction))
+        if len(seed_vectors) < self.min_relation_family_size:
+            return []
+
+        directions = np.asarray([direction for _seed, direction in seed_vectors], dtype=float)
+        raw_families: list[tuple[int, float, np.ndarray, list[_RelationSeed]]] = []
+        for _index, (_seed, direction) in enumerate(seed_vectors):
+            similarities = directions @ direction
+            neighbor_indices = [
+                int(item)
+                for item, similarity in enumerate(similarities)
+                if similarity >= self.relation_family_similarity
+            ]
+            if len(neighbor_indices) < self.min_relation_family_size:
+                continue
+            family_directions = directions[neighbor_indices]
+            centroid = _normalize(np.mean(family_directions, axis=0))[0]
+            coherence = float(np.mean(family_directions @ centroid))
+            family_seeds = [seed_vectors[item][0] for item in neighbor_indices]
+            raw_families.append((len(family_seeds), coherence, centroid, family_seeds))
+
+        families: list[_RelationFamily] = []
+        for size, coherence, centroid, family_seeds in sorted(raw_families, key=lambda item: (item[0], item[1]), reverse=True):
+            if any(float(np.dot(centroid, existing.centroid)) >= self.relation_family_similarity for existing in families):
+                continue
+            tag_counts: Counter[str] = Counter(tag for seed in family_seeds for tag in seed.tags)
+            families.append(
+                _RelationFamily(
+                    family_id=f"relation-family-{len(families):05d}",
+                    centroid=centroid,
+                    size=size,
+                    coherence=round(_clamp01(coherence), 4),
+                    source_tags=tuple(tag for tag, _count in tag_counts.most_common()),
+                    example_pairs=tuple((seed.source_index, seed.target_index) for seed in family_seeds[:8]),
+                )
+            )
+        return families
+
     def _is_near_selected_proof_conclusion(
         self,
         *,
@@ -4518,16 +7409,19 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
         language_score: float,
         edge: "_ConsensusEdge | None",
         prompt_wants_support: bool,
+        relation_geometry: "_DocumentRelationGeometry | None" = None,
     ) -> float:
         signal = signals[proposition.element_index]
         stability = edge.stability if edge is not None else 0.0
         structural = edge.structural_bonus if edge is not None else 0.0
+        relation_score = relation_geometry.score(core_prop_index, prop_index) if relation_geometry is not None else 0.0
         score = (
             prompt_similarity * 0.42
             + core_similarity * 0.3
             + stability * 0.13
             + structural * 0.05
             + language_score * self.language_candidate_weight
+            + relation_score * self.relation_geometry_weight
         )
         if prop_index == core_prop_index:
             score += 1.0
@@ -4673,6 +7567,35 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
                 break
         return candidates
 
+    def _document_language_cache_for(
+        self,
+        propositions: list[QueryEvidenceProposition],
+    ) -> _DocumentLanguageCache:
+        key = self._document_cache_key(
+            namespace="document-language",
+            propositions=propositions,
+        )
+        cached = self._document_language_cache.get(key)
+        if cached is not None:
+            return cached
+
+        language_map = _DocumentLanguageMap.build(propositions)
+        if language_map.units:
+            unit_embeddings = self._embed([unit.text for unit in language_map.units])
+        else:
+            unit_embeddings = np.zeros((0, 0), dtype=float)
+        cached = _DocumentLanguageCache(
+            key=key,
+            language_map=language_map,
+            unit_embeddings=unit_embeddings,
+        )
+        self._document_language_cache[key] = cached
+        if len(self._document_language_cache) > 8:
+            oldest_key = next(iter(self._document_language_cache))
+            if oldest_key != key:
+                self._document_language_cache.pop(oldest_key, None)
+        return cached
+
     def _language_proposition_scores(
         self,
         *,
@@ -4682,16 +7605,15 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
         if not self.use_language_map or not propositions:
             return np.zeros(len(propositions), dtype=float)
 
-        language_map = _DocumentLanguageMap.build(propositions)
+        language_cache = self._document_language_cache_for(propositions)
+        language_map = language_cache.language_map
         query_units = _extract_language_units(prompt, proposition_index=-1, element_id="", element_index=-1)
         if not language_map.units or not query_units:
             return np.zeros(len(propositions), dtype=float)
 
         query_texts = [unit.text for unit in query_units]
-        document_texts = [unit.text for unit in language_map.units]
-        embeddings = self._embed([*query_texts, *document_texts])
-        query_embeddings = embeddings[: len(query_texts)]
-        document_embeddings = embeddings[len(query_texts) :]
+        query_embeddings = self._embed(query_texts)
+        document_embeddings = language_cache.unit_embeddings
         similarities = document_embeddings @ query_embeddings.T
 
         scores: dict[int, list[float]] = defaultdict(list)
@@ -4862,6 +7784,77 @@ class _ConsensusEdge:
     structural_bonus: float
 
 
+@dataclass(frozen=True)
+class _RelationSeed:
+    source_index: int
+    target_index: int
+    tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _RelationFamily:
+    family_id: str
+    centroid: np.ndarray
+    size: int
+    coherence: float
+    source_tags: tuple[str, ...] = ()
+    example_pairs: tuple[tuple[int, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class _DocumentRelationGeometry:
+    proposition_embeddings: np.ndarray
+    families: list[_RelationFamily]
+    relation_family_similarity: float
+
+    @classmethod
+    def empty(
+        cls,
+        *,
+        proposition_embeddings: np.ndarray,
+        relation_family_similarity: float,
+    ) -> "_DocumentRelationGeometry":
+        return cls(
+            proposition_embeddings=proposition_embeddings,
+            families=[],
+            relation_family_similarity=relation_family_similarity,
+        )
+
+    def best_family(self, source_index: int, target_index: int) -> _RelationFamily | None:
+        direction = _relation_delta_direction(
+            self.proposition_embeddings,
+            source_index=source_index,
+            target_index=target_index,
+        )
+        if direction is None or not self.families:
+            return None
+        scored = [
+            (float(np.dot(direction, family.centroid)), family)
+            for family in self.families
+        ]
+        best_similarity, best_family = max(scored, key=lambda item: item[0])
+        if best_similarity < self.relation_family_similarity:
+            return None
+        return best_family
+
+    def score(self, source_index: int, target_index: int) -> float:
+        direction = _relation_delta_direction(
+            self.proposition_embeddings,
+            source_index=source_index,
+            target_index=target_index,
+        )
+        if direction is None or not self.families:
+            return 0.0
+        best_score = 0.0
+        for family in self.families:
+            similarity = float(np.dot(direction, family.centroid))
+            if similarity < self.relation_family_similarity:
+                continue
+            scaled_similarity = (similarity - self.relation_family_similarity) / max(1e-6, 1.0 - self.relation_family_similarity)
+            best_score = max(best_score, scaled_similarity * family.coherence)
+        return _clamp01(best_score)
+
+
 class _EmbeddingBackend:
     def __init__(self, config: BuilderConfig) -> None:
         self.config = config
@@ -4929,6 +7922,23 @@ def _normalize(embeddings: np.ndarray) -> np.ndarray:
     norms[norms == 0] = 1.0
     normalized = embeddings / norms
     return normalized
+
+
+def _relation_delta_direction(
+    embeddings: np.ndarray,
+    *,
+    source_index: int,
+    target_index: int,
+) -> np.ndarray | None:
+    if source_index < 0 or target_index < 0:
+        return None
+    if source_index >= len(embeddings) or target_index >= len(embeddings):
+        return None
+    delta = np.asarray(embeddings[target_index] - embeddings[source_index], dtype=float)
+    norm = float(np.linalg.norm(delta))
+    if norm <= 1e-9:
+        return None
+    return delta / norm
 
 
 def _extract_language_units(
@@ -5092,6 +8102,13 @@ def _jaccard(left: Iterable[str], right: Iterable[str]) -> float:
 
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
+
+
+def _preview(text: str, *, limit: int = 220) -> str:
+    preview = re.sub(r"\s+", " ", text).strip()
+    if len(preview) <= limit:
+        return preview
+    return preview[: max(0, limit - 3)].rstrip() + "..."
 
 
 def _role_family(role: str) -> str:
