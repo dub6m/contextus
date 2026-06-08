@@ -1,10 +1,15 @@
+from collections import Counter
+
 import numpy as np
 
 from contextus.builder.query_assembly import (
     ConsensusKnnPropositionEvidenceAssembler,
     PropositionQueryTimeEvidenceAssembler,
+    QueryAssemblyResult,
+    QueryEvidenceProposition,
     QueryTimeEvidenceAssembler,
 )
+from contextus.builder.dependency_resolver import FactFrame, ResolvedPackage, SourceRef
 from contextus.ingestion.models import ExtractedDocument, ExtractedElement, ExtractedPage
 from contextus.llm import LLMResponse
 
@@ -65,6 +70,73 @@ def bridge_embed(texts: list[str]) -> np.ndarray:
             ]
         )
     return np.asarray(vectors, dtype=float)
+
+
+def division_embed(texts: list[str]) -> np.ndarray:
+    vectors = []
+    for text in texts:
+        lowered = text.lower()
+        vectors.append(
+            [
+                lowered.count("alpha"),
+                lowered.count("mitosis"),
+                lowered.count("meiosis"),
+                lowered.count("somatic"),
+                lowered.count("haploid"),
+                lowered.count("punnett"),
+            ]
+        )
+    return np.asarray(vectors, dtype=float)
+
+
+def relation_delta_embed(texts: list[str]) -> np.ndarray:
+    vectors = []
+    for text in texts:
+        lowered = text.lower()
+        if "heading" in lowered:
+            vectors.append([1.0, 0.0, 0.0, 0.0])
+        elif "body" in lowered:
+            vectors.append([1.0, 1.0, 0.0, 0.0])
+        elif "other" in lowered:
+            vectors.append([0.0, 0.0, 1.0, 0.0])
+        else:
+            vectors.append([0.0, 0.0, 0.0, 1.0])
+    return np.asarray(vectors, dtype=float)
+
+
+def proposition_for(index: int, element: ExtractedElement) -> QueryEvidenceProposition:
+    return QueryEvidenceProposition(
+        proposition_id=f"{element.id}::p00",
+        element_id=element.id,
+        element_index=index,
+        text=str(element.content),
+    )
+
+
+def test_query_assembly_result_serializes_dependency_packages():
+    result = QueryAssemblyResult(
+        prompt="alpha question",
+        packages=[],
+        dependency_packages=[
+            ResolvedPackage(
+                core_frames=[
+                    FactFrame(
+                        frame_id="frame:core",
+                        source=SourceRef(element_id="core", proposition_id="core::p00"),
+                        predicate="claim",
+                    )
+                ],
+                selected_frames=[],
+                selected_elements=[],
+                resolved_needs=[],
+                unresolved_needs=[],
+            )
+        ],
+    )
+
+    payload = result.to_dict()
+
+    assert payload["dependency_packages"][0]["core_frames"][0]["frame_id"] == "frame:core"
 
 
 def test_query_time_assembler_uses_top_five_candidate_cores():
@@ -341,8 +413,88 @@ def test_consensus_knn_assembler_keeps_isolated_noise_as_singleton():
     ).assemble(make_document(elements), "gamma question")
     package = result.packages[0]
 
-    assert package.core_element_id == "core"
+    assert package.seed_core_element_id == "core"
     assert package.element_ids == ["core"]
+
+
+def test_document_relation_geometry_scores_repeated_local_delta_family():
+    elements = [
+        make_element("h1", "heading one", order=1, element_type="title"),
+        make_element("b1", "body one", order=2),
+        make_element("h2", "heading two", order=3, element_type="title"),
+        make_element("b2", "body two", order=4),
+        make_element("other", "other topic", order=5),
+    ]
+    assembler = ConsensusKnnPropositionEvidenceAssembler(
+        embed_texts=relation_delta_embed,
+        min_relation_family_size=2,
+        relation_family_similarity=0.95,
+    )
+    signals = [signal for signal in assembler._signal_builder.build(make_document(elements)).signals if signal.text.strip()]
+    propositions = [proposition_for(index, element) for index, element in enumerate(elements)]
+    embeddings = assembler._embed([proposition.text for proposition in propositions])
+    geometry = assembler._document_relation_geometry(
+        signals=signals,
+        propositions=propositions,
+        proposition_embeddings=embeddings,
+        graph={},
+    )
+
+    assert geometry.score(0, 1) > 0.6
+    assert geometry.score(0, 4) < 0.2
+    assert geometry.best_family(0, 1) is not None
+
+
+def test_cluster_candidate_score_uses_document_relation_geometry_bonus():
+    elements = [
+        make_element("h1", "heading one", order=1, element_type="title"),
+        make_element("b1", "body one", order=2),
+        make_element("h2", "heading two", order=3, element_type="title"),
+        make_element("b2", "body two", order=4),
+        make_element("other", "other topic", order=5),
+    ]
+    assembler = ConsensusKnnPropositionEvidenceAssembler(
+        embed_texts=relation_delta_embed,
+        min_relation_family_size=2,
+        relation_family_similarity=0.95,
+        relation_geometry_weight=0.2,
+    )
+    signals = [signal for signal in assembler._signal_builder.build(make_document(elements)).signals if signal.text.strip()]
+    propositions = [proposition_for(index, element) for index, element in enumerate(elements)]
+    embeddings = assembler._embed([proposition.text for proposition in propositions])
+    geometry = assembler._document_relation_geometry(
+        signals=signals,
+        propositions=propositions,
+        proposition_embeddings=embeddings,
+        graph={},
+    )
+
+    related = assembler._cluster_candidate_score(
+        signals=signals,
+        proposition=propositions[1],
+        core_prop_index=0,
+        prop_index=1,
+        prompt_similarity=0.2,
+        core_similarity=0.2,
+        language_score=0.0,
+        edge=None,
+        prompt_wants_support=False,
+        relation_geometry=geometry,
+    )
+    unrelated = assembler._cluster_candidate_score(
+        signals=signals,
+        proposition=propositions[4],
+        core_prop_index=0,
+        prop_index=4,
+        prompt_similarity=0.2,
+        core_similarity=0.2,
+        language_score=0.0,
+        edge=None,
+        prompt_wants_support=False,
+        relation_geometry=geometry,
+    )
+
+    assert related > unrelated
 
 
 def test_consensus_knn_assembler_expands_primary_span_for_reference_closure():
@@ -368,7 +520,7 @@ def test_consensus_knn_assembler_expands_primary_span_for_reference_closure():
     ).assemble(make_document(elements), "alpha proof")
     package = result.packages[0]
 
-    assert package.core_element_id == "core"
+    assert package.seed_core_element_id == "core"
     assert package.element_ids == ["setup", "core"]
 
 
@@ -470,6 +622,108 @@ def test_consensus_knn_assembler_uses_source_grounded_query_plan_for_core_discov
     assert result.packages[0].core_element_id == "proof"
 
 
+def test_consensus_knn_assembler_uses_dependency_resolver_selected_role_target_as_anchor():
+    elements = [
+        make_element("core", "Alpha proof claim.", order=1),
+        make_element("support", "Candidate points are bounded.", order=2),
+    ]
+    llm = PropositionLLM(
+        '{"elements":['
+        '{"element_id":"core","propositions":[{"text":"Alpha proof claim.",'
+        '"roles":[{"role":"proof_reason","target":"alpha proof claim","value":"candidate points","confidence":0.9,"reason":"The proof depends on candidate points."}]}]},'
+        '{"element_id":"support","propositions":[{"text":"Candidate points are bounded.",'
+        '"roles":[{"role":"quantity_bound","target":"candidate points","value":"constant bound","confidence":0.9,"reason":"Bounds candidate points."}]}]}'
+        ']}'
+    )
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        use_dependency_resolver=True,
+    ).assemble(make_document(elements), "alpha proof")
+
+    assert result.dependency_packages
+    assert result.dependency_packages[0].selected_elements == ("support",)
+    assert result.packages[0].element_ids == ["core", "support"]
+
+
+def test_consensus_knn_dependency_resolver_does_not_attach_repeated_role_target():
+    elements = [
+        make_element("core", "Mitosis and Meiosis", order=1),
+        make_element("repeat", "Mitosis and Meiosis", order=2),
+    ]
+    llm = PropositionLLM(
+        '{"elements":['
+        '{"element_id":"core","propositions":[{"text":"Mitosis and Meiosis",'
+        '"roles":[{"role":"heading","target":"mitosis and meiosis","value":"section title","confidence":0.9,"reason":"Heading."}]}]},'
+        '{"element_id":"repeat","propositions":[{"text":"Mitosis and Meiosis",'
+        '"roles":[{"role":"heading","target":"mitosis and meiosis","value":"repeated section title","confidence":0.9,"reason":"Repeated heading."}]}]}'
+        ']}'
+    )
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=division_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        use_dependency_resolver=True,
+    ).assemble(make_document(elements), "mitosis meiosis")
+
+    assert result.dependency_packages
+    assert result.dependency_packages[0].selected_elements == ()
+
+
+def test_consensus_knn_dependency_resolver_uses_document_native_terms_without_roles():
+    elements = [
+        make_element("core", "Alpha claim depends on candidate points.", order=1),
+        make_element("support", "Candidate points have a constant bound.", order=2),
+    ]
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=None,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        use_dependency_resolver=True,
+    ).assemble(make_document(elements), "alpha claim")
+
+    assert result.dependency_packages
+    assert result.dependency_packages[0].selected_elements == ("support",)
+    assert result.packages[0].element_ids == ["core", "support"]
+
+
+def test_consensus_knn_dependency_resolver_rejects_repeated_document_native_label():
+    elements = [
+        make_element("core", "Mitosis and Meiosis", order=1),
+        make_element("repeat", "Mitosis and Meiosis", order=2),
+    ]
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=None,
+        embed_texts=division_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        use_dependency_resolver=True,
+    ).assemble(make_document(elements), "mitosis meiosis")
+
+    assert result.dependency_packages
+    assert result.dependency_packages[0].selected_elements == ()
+
+
 def test_consensus_knn_assembler_builds_multi_anchor_package_from_query_sub_needs():
     elements = [
         make_element("setup", "Zeta alpha setup defines the strip.", order=1),
@@ -521,6 +775,407 @@ def test_consensus_knn_assembler_builds_multi_anchor_package_from_query_sub_need
     assert "proof" in package.element_ids
 
 
+def test_consensus_knn_assembler_returns_answer_bundle_with_one_package_per_sub_need():
+    elements = [
+        make_element("setup", "Zeta alpha setup defines the strip.", order=1),
+        make_element("filler", "banana filler", order=2),
+        make_element("proof", "Rows boxes zeta proof explains bounded nearby checks.", order=3),
+    ]
+    llm = SequenceLLM(
+        [
+            (
+                '{"elements":['
+                '{"element_id":"setup","propositions":[{"text":"Zeta alpha setup defines the strip.",'
+                '"roles":[{"role":"definition","target":"Zeta","value":"the strip","confidence":0.9,"reason":"Defines the strip."}]}]},'
+                '{"element_id":"filler","propositions":["Banana filler."]},'
+                '{"element_id":"proof","propositions":[{"text":"Rows boxes zeta proof explains bounded nearby checks.",'
+                '"roles":[{"role":"proof_reason","target":"bounded nearby checks","value":"rows boxes proof","confidence":0.9,"reason":"Explains the proof bound."}]}]}'
+                ']}'
+            ),
+            (
+                '{"interpreted_need":"Explain alpha nearby checks using setup and proof.",'
+                '"query_type":"proof_explanation",'
+                '"source_supported_terms":["zeta","strip","rows","boxes"],'
+                '"possible_missing_prerequisites":["zeta strip"],'
+                '"search_forms":["zeta strip rows boxes proof"],'
+                '"uncertainties":[],'
+                '"sub_needs":['
+                '{"need":"define the strip","search_terms":["zeta","strip"],"expected_roles":["definition"]},'
+                '{"need":"explain bounded nearby proof","search_terms":["rows","boxes","nearby"],"expected_roles":["proof_reason"]}'
+                ']}'
+            ),
+        ]
+    )
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=bridge_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        max_attached_spans=2,
+        use_query_planner=True,
+    ).assemble(make_document(elements), "why alpha nearby")
+
+    assert result.answer_bundle is not None
+    assert [part.sub_need for part in result.answer_bundle.parts] == [
+        "define the strip",
+        "explain bounded nearby proof",
+    ]
+    assert result.answer_bundle.parts[0].package.seed_core_element_id == "setup"
+    assert result.answer_bundle.parts[1].package.seed_core_element_id == "proof"
+    assert result.answer_bundle.parts[0].package.package_id == "query-bundle-package-00000"
+    assert result.answer_bundle.parts[1].package.package_id == "query-bundle-package-00001"
+
+
+def test_consensus_knn_assembler_reports_source_traversal_audit():
+    elements = [
+        make_element("setup", "Alpha setup defines line L for the proof.", order=1),
+        make_element("reason", "Because alpha points near line L are compared.", order=2),
+        make_element("filler", "banana filler", order=3),
+    ]
+    llm = PropositionLLM(
+        '{"elements":['
+        '{"element_id":"setup","propositions":[{"text":"Alpha setup defines line L for the proof.",'
+        '"roles":[{"role":"definition","target":"line L","value":"proof line","confidence":0.9,"reason":"Defines line L."}]}]},'
+        '{"element_id":"reason","propositions":[{"text":"Because alpha points near line L are compared.",'
+        '"roles":[{"role":"proof_reason","target":"comparison","value":"near line L","confidence":0.9,"reason":"Explains the proof comparison."}]}]},'
+        '{"element_id":"filler","propositions":["Banana filler."]}'
+        ']}'
+    )
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        max_attached_spans=0,
+        source_traversal_rounds=2,
+    ).assemble(make_document(elements), "alpha setup proof")
+
+    assert result.source_traversals
+    trace = result.source_traversals[0]
+    assert trace.anchor_element_id == "setup"
+    assert "reason" in trace.accepted_element_ids
+    accepted_candidates = [candidate for candidate in trace.candidates if candidate.action == "accepted"]
+    assert any(candidate.element_id == "reason" for candidate in accepted_candidates)
+    assert any("adjacent_next" in candidate.relation_tags for candidate in accepted_candidates)
+
+
+def test_source_traversal_uses_bridge_without_adding_it_as_evidence():
+    elements = [
+        make_element("setup", "Alpha setup defines line L for the proof.", order=1),
+        make_element("bridge", "and the of", order=2),
+        make_element("reason", "Because alpha line L comparison completes the proof.", order=3),
+    ]
+    llm = PropositionLLM(
+        '{"elements":['
+        '{"element_id":"setup","propositions":[{"text":"Alpha setup defines line L for the proof.",'
+        '"roles":[{"role":"definition","target":"line L","value":"proof line","confidence":0.9,"reason":"Defines line L."}]}]},'
+        '{"element_id":"bridge","propositions":["and the of"]},'
+        '{"element_id":"reason","propositions":[{"text":"Because alpha line L comparison completes the proof.",'
+        '"roles":[{"role":"proof_reason","target":"comparison","value":"line L comparison","confidence":0.9,"reason":"Explains the comparison."}]}]}'
+        ']}'
+    )
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        max_attached_spans=0,
+        source_traversal_rounds=2,
+    ).assemble(make_document(elements), "alpha setup proof")
+
+    trace = result.source_traversals[0]
+    assert "reason" in trace.accepted_element_ids
+    assert "bridge" not in trace.accepted_element_ids
+    assert any(candidate.element_id == "bridge" and candidate.action == "bridge" for candidate in trace.candidates)
+
+
+def test_source_traversal_rejects_redundant_successor_after_path_is_sufficient():
+    elements = [
+        make_element("setup", "Alpha setup defines line L for the proof.", order=1),
+        make_element("reason", "Because alpha line L comparison completes the proof.", order=2),
+        make_element("repeat", "Because alpha line L comparison completes the proof.", order=3),
+    ]
+    llm = PropositionLLM(
+        '{"elements":['
+        '{"element_id":"setup","propositions":[{"text":"Alpha setup defines line L for the proof.",'
+        '"roles":[{"role":"definition","target":"line L","value":"proof line","confidence":0.9,"reason":"Defines line L."}]}]},'
+        '{"element_id":"reason","propositions":[{"text":"Because alpha line L comparison completes the proof.",'
+        '"roles":[{"role":"proof_reason","target":"comparison","value":"line L comparison","confidence":0.9,"reason":"Explains the comparison."}]}]},'
+        '{"element_id":"repeat","propositions":[{"text":"Because alpha line L comparison completes the proof.",'
+        '"roles":[{"role":"proof_reason","target":"comparison","value":"line L comparison","confidence":0.9,"reason":"Repeats the comparison."}]}]}'
+        ']}'
+    )
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        max_attached_spans=0,
+        source_traversal_rounds=2,
+    ).assemble(make_document(elements), "alpha setup proof")
+
+    trace = result.source_traversals[0]
+    assert "reason" in trace.accepted_element_ids
+    rejected = [candidate for candidate in trace.candidates if candidate.element_id == "repeat"]
+    assert rejected
+    assert all(candidate.action == "rejected" for candidate in rejected)
+
+
+def test_source_traversal_rejects_adjacent_wrong_topic_instead_of_bridging():
+    elements = [
+        make_element("setup", "Alpha setup defines line L for the proof.", order=1),
+        make_element("wrong", "Delta meiosis table explains inheritance.", order=2),
+    ]
+    llm = PropositionLLM(
+        '{"elements":['
+        '{"element_id":"setup","propositions":[{"text":"Alpha setup defines line L for the proof.",'
+        '"roles":[{"role":"definition","target":"line L","value":"proof line","confidence":0.9,"reason":"Defines line L."}]}]},'
+        '{"element_id":"wrong","propositions":[{"text":"Delta meiosis table explains inheritance.",'
+        '"roles":[{"role":"proof_reason","target":"inheritance","value":"meiosis table","confidence":0.9,"reason":"Explains another topic."}]}]}'
+        ']}'
+    )
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        max_attached_spans=0,
+        source_traversal_rounds=2,
+    ).assemble(make_document(elements), "alpha setup proof")
+
+    trace = result.source_traversals[0]
+    assert "wrong" not in trace.accepted_element_ids
+    wrong_candidates = [candidate for candidate in trace.candidates if candidate.element_id == "wrong"]
+    assert wrong_candidates
+    assert all(candidate.action == "rejected" for candidate in wrong_candidates)
+
+
+def test_source_traversal_rejects_support_candidate_that_shares_only_prompt_word():
+    elements = [
+        make_element("anchor", "Alpha meiosis produces four haploid cells.", order=1),
+        make_element("good", "Meiosis produces haploid outcome after chromosome division.", order=2),
+        make_element("wrong-figure", "Figure: Alpha shows a Punnett square with brown eye rows.", order=3, element_type="figure"),
+        make_element("filler", "banana filler", order=4),
+    ]
+    llm = PropositionLLM(
+        '{"elements":['
+        '{"element_id":"anchor","propositions":[{"text":"Alpha meiosis produces four haploid cells.",'
+        '"roles":[{"role":"visual_support","target":"meiosis","value":"four haploid cells","confidence":0.9,"reason":"Names the figure claim."}]}]},'
+        '{"element_id":"good","propositions":[{"text":"Meiosis produces haploid outcome after chromosome division.",'
+        '"roles":[{"role":"proof_reason","target":"haploid outcome","value":"chromosome division","confidence":0.9,"reason":"Explains the same claim."}]}]},'
+        '{"element_id":"wrong-figure","propositions":[{"text":"Figure: Alpha shows a Punnett square with brown eye rows.",'
+        '"roles":[{"role":"visual_support","target":"Punnett square","value":"brown eye rows","confidence":0.9,"reason":"Different figure."}]}]},'
+        '{"element_id":"filler","propositions":["Banana filler."]}'
+        ']}'
+    )
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        max_attached_spans=0,
+        source_traversal_rounds=2,
+    ).assemble(make_document(elements), "What does the alpha figure show?")
+
+    trace = result.source_traversals[0]
+    assert "good" in trace.accepted_element_ids
+    assert "wrong-figure" not in trace.accepted_element_ids
+    wrong_candidates = [candidate for candidate in trace.candidates if candidate.element_id == "wrong-figure"]
+    assert wrong_candidates
+    assert all(candidate.action == "rejected" for candidate in wrong_candidates)
+
+
+def test_source_traversal_rejects_non_support_candidate_with_foreign_claim_units():
+    elements = [
+        make_element("anchor", "Alpha meiosis produces four haploid cells.", order=1),
+        make_element("wrong-text", "Alpha mitosis replicates somatic cells.", order=2),
+        make_element("filler-1", "banana filler one", order=3),
+        make_element("filler-2", "banana filler two", order=4),
+        make_element("filler-3", "banana filler three", order=5),
+        make_element("filler-4", "banana filler four", order=6),
+        make_element("filler-5", "banana filler five", order=7),
+        make_element("filler-6", "banana filler six", order=8),
+        make_element("filler-7", "banana filler seven", order=9),
+    ]
+    llm = PropositionLLM(
+        '{"elements":['
+        '{"element_id":"anchor","propositions":[{"text":"Alpha meiosis produces four haploid cells.",'
+        '"roles":[{"role":"visual_support","target":"meiosis","value":"four haploid cells","confidence":0.9,"reason":"Names the path claim."}]}]},'
+        '{"element_id":"wrong-text","propositions":[{"text":"Alpha mitosis replicates somatic cells.",'
+        '"roles":[{"role":"proof_reason","target":"mitosis","value":"somatic cell replication","confidence":0.9,"reason":"Nearby but different claim."}]}]},'
+        '{"element_id":"filler-1","propositions":["Banana filler one."]},'
+        '{"element_id":"filler-2","propositions":["Banana filler two."]},'
+        '{"element_id":"filler-3","propositions":["Banana filler three."]},'
+        '{"element_id":"filler-4","propositions":["Banana filler four."]},'
+        '{"element_id":"filler-5","propositions":["Banana filler five."]},'
+        '{"element_id":"filler-6","propositions":["Banana filler six."]},'
+        '{"element_id":"filler-7","propositions":["Banana filler seven."]}'
+        ']}'
+    )
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        max_attached_spans=0,
+        source_traversal_rounds=2,
+    ).assemble(make_document(elements), "alpha meiosis haploid cells")
+
+    trace = result.source_traversals[0]
+    assert "wrong-text" not in trace.accepted_element_ids
+    wrong_candidates = [candidate for candidate in trace.candidates if candidate.element_id == "wrong-text"]
+    assert wrong_candidates
+    assert all(candidate.action == "rejected" for candidate in wrong_candidates)
+    assert any("different claim path" in candidate.reason for candidate in wrong_candidates)
+
+
+def test_source_traversal_accepts_symbolic_list_frame_continuation():
+    elements = [
+        make_element("intro", "Alpha procedure creates local Q objects.", order=1),
+        make_element("item-qx", "1. Alpha Qx is sorted by x coordinate.", order=2),
+        make_element("item-qy", "2. Alpha Qy is sorted by y coordinate.", order=3),
+        make_element("wrong-text", "Alpha mitosis replicates somatic cells.", order=4),
+    ]
+    llm = PropositionLLM(
+        '{"elements":['
+        '{"element_id":"intro","propositions":[{"text":"Alpha procedure creates local Q objects.",'
+        '"roles":[{"role":"procedure","target":"Q objects","value":"creates local objects","confidence":0.9,"reason":"Procedure setup."}]}]},'
+        '{"element_id":"item-qx","propositions":[{"text":"Alpha Qx is sorted by x coordinate.",'
+        '"roles":[{"role":"procedure","target":"Qx","value":"sorted by x coordinate","confidence":0.9,"reason":"List item."}]}]},'
+        '{"element_id":"item-qy","propositions":[{"text":"Alpha Qy is sorted by y coordinate.",'
+        '"roles":[{"role":"procedure","target":"Qy","value":"sorted by y coordinate","confidence":0.9,"reason":"List item."}]}]},'
+        '{"element_id":"wrong-text","propositions":[{"text":"Alpha mitosis replicates somatic cells.",'
+        '"roles":[{"role":"proof_reason","target":"mitosis","value":"somatic cell replication","confidence":0.9,"reason":"Different claim."}]}]}'
+        ']}'
+    )
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        max_attached_spans=0,
+        source_traversal_rounds=2,
+    ).assemble(make_document(elements), "alpha procedure creates q objects")
+
+    trace = result.source_traversals[0]
+    assert "item-qy" in trace.accepted_element_ids
+    frame_candidates = [candidate for candidate in trace.candidates if candidate.element_id == "item-qy"]
+    assert frame_candidates
+    assert any(candidate.frame_continuation == "list_frame_continuation" for candidate in frame_candidates)
+    assert "wrong-text" not in trace.accepted_element_ids
+
+
+def test_source_traversal_starts_second_center_for_source_backed_prompt_aspect():
+    elements = [
+        make_element("mitosis", "Alpha mitosis explains somatic cell division.", order=1),
+        make_element("meiosis", "Alpha meiosis produces haploid reproductive cells.", order=2),
+        make_element("wrong", "Alpha Punnett square tracks eye color rows.", order=3),
+    ]
+    llm = PropositionLLM(
+        '{"elements":['
+        '{"element_id":"mitosis","propositions":[{"text":"Alpha mitosis explains somatic cell division.",'
+        '"roles":[{"role":"comparison","target":"mitosis","value":"somatic cell division","confidence":0.9,"reason":"One comparison side."}]}]},'
+        '{"element_id":"meiosis","propositions":[{"text":"Alpha meiosis produces haploid reproductive cells.",'
+        '"roles":[{"role":"comparison","target":"meiosis","value":"haploid reproductive cells","confidence":0.9,"reason":"Second comparison side."}]}]},'
+        '{"element_id":"wrong","propositions":[{"text":"Alpha Punnett square tracks eye color rows.",'
+        '"roles":[{"role":"comparison","target":"Punnett square","value":"eye color rows","confidence":0.9,"reason":"Different comparison topic."}]}]}'
+        ']}'
+    )
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=division_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        max_attached_spans=0,
+        source_traversal_rounds=2,
+    ).assemble(make_document(elements), "compare alpha mitosis somatic and meiosis haploid")
+
+    trace = result.source_traversals[0]
+    assert {"mitosis", "meiosis"} <= set(trace.accepted_element_ids)
+    assert len(trace.centers) >= 2
+    assert any(candidate.element_id == "meiosis" and candidate.center_decision == "new_center" for candidate in trace.candidates)
+    assert "wrong" not in trace.accepted_element_ids
+    traversal_package_element_sets = [set(package.element_ids) for package in result.source_traversal_packages]
+    assert any({"mitosis"} <= element_ids for element_ids in traversal_package_element_sets)
+    assert any({"meiosis"} <= element_ids for element_ids in traversal_package_element_sets)
+    assert result.source_traversal_answer_bundle is not None
+    bundle_part_element_sets = [
+        set(part.evidence_element_ids)
+        for part in result.source_traversal_answer_bundle.parts
+    ]
+    assert any({"mitosis"} <= element_ids for element_ids in bundle_part_element_sets)
+    assert any({"meiosis"} <= element_ids for element_ids in bundle_part_element_sets)
+
+
+def test_source_traversal_claim_alignment_blocks_different_support_object():
+    assembler = ConsensusKnnPropositionEvidenceAssembler(embed_texts=keyword_embed)
+    path_signature = assembler._source_traversal_claim_units("Alpha meiosis produces four haploid cells.")
+    candidate_units = assembler._source_traversal_claim_units("Figure: Alpha shows a Punnett square with brown eye rows.")
+    prompt_units = assembler._source_traversal_claim_units("What does the alpha figure show?")
+    document_texts = [
+        "Alpha meiosis produces four haploid cells.",
+        "Meiosis produces haploid outcome after chromosome division.",
+        "Figure: Alpha shows a Punnett square with brown eye rows.",
+        "banana filler",
+    ]
+    document_unit_counts = Counter()
+    document_claim_unit_counts = Counter()
+    for text in document_texts:
+        document_unit_counts.update(assembler._source_traversal_units(text))
+        document_claim_unit_counts.update(assembler._source_traversal_claim_units(text))
+
+    alignment = assembler._source_traversal_claim_alignment(
+        candidate_claim_units=candidate_units,
+        path_signature=path_signature,
+        path_signature_tokens=assembler._source_traversal_claim_tokens(path_signature),
+        prompt_claim_tokens=assembler._source_traversal_claim_tokens(prompt_units),
+        relation_tags={"adjacent_next"},
+        candidate_support_like=True,
+        document_unit_counts=document_unit_counts,
+        document_claim_unit_counts=document_claim_unit_counts,
+        document_size=len(document_texts),
+    )
+
+    assert not alignment["ok"]
+    assert "different claim path" in str(alignment["reason"])
+
+
 def test_consensus_knn_assembler_completes_missing_definition_and_conclusion_roles():
     elements = [
         make_element("definition", "Let Z denote the alpha proof strip.", order=1),
@@ -553,7 +1208,7 @@ def test_consensus_knn_assembler_completes_missing_definition_and_conclusion_rol
     ).assemble(make_document(elements), "why gamma alpha nearby")
     package = result.packages[0]
 
-    assert package.core_element_id == "core"
+    assert package.seed_core_element_id == "core"
     assert "definition" in package.element_ids
     assert "conclusion" in package.element_ids
     assert "filler" not in package.element_ids
@@ -598,7 +1253,7 @@ def test_consensus_knn_assembler_uses_llm_role_hypotheses_for_completion():
     ).assemble(make_document(elements), "why gamma alpha")
     package = result.packages[0]
 
-    assert package.core_element_id == "core"
+    assert package.seed_core_element_id == "core"
     assert "definition" in package.element_ids
     assert result.propositions[0].roles[0].role == "definition"
     assert result.propositions[0].grounding is not None
@@ -715,7 +1370,7 @@ def test_consensus_knn_assembler_attaches_consecutive_role_span():
     ).assemble(make_document(elements), "why gamma alpha nearby")
     package = result.packages[0]
 
-    assert package.core_element_id == "core"
+    assert package.seed_core_element_id == "core"
     assert "definition" in package.element_ids
     assert "bound" in package.element_ids
     assert any("role span attachment" in decision.reason for decision in package.decisions)
@@ -756,7 +1411,7 @@ def test_consensus_knn_assembler_makes_distant_same_role_candidates_compete():
     ).assemble(make_document(elements), "why gamma alpha")
     package = result.packages[0]
 
-    assert package.core_element_id == "core"
+    assert package.seed_core_element_id == "core"
     assert "strong-definition" in package.element_ids
     assert "weak-definition" not in package.element_ids
     diagnostics = package.completion_diagnostics
@@ -805,7 +1460,7 @@ def test_consensus_knn_assembler_does_not_attach_repeated_filled_role_need():
     ).assemble(make_document(elements), "why gamma alpha")
     package = result.packages[0]
 
-    assert package.core_element_id == "core"
+    assert package.seed_core_element_id == "core"
     assert "strong-definition" in package.element_ids
     assert "weak-definition" not in package.element_ids
     diagnostics = package.completion_diagnostics

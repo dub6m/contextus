@@ -27,6 +27,7 @@ Thumbs.db
 
 # Runtime artefacts
 audits/
+chunk_runs/
 graphs/
 extractions/
 models/
