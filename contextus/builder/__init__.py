@@ -58,6 +58,16 @@ from .query_assembly import (
     QueryAssemblyResult,
     QueryTimeEvidenceAssembler,
 )
+from .query_needs import (
+    PropositionNeedHint,
+    QueryContext,
+    QueryNeed,
+    QueryNeedPackage,
+    QueryNeedResolver,
+    QueryNeedSupport,
+    QueryNeedTraceStep,
+    build_query_context,
+)
 from .dependency_resolver import (
     CandidateSupport,
     ConstraintCandidate,
@@ -81,6 +91,14 @@ from .dependency_resolver import (
     TermMention,
     normalize_term_text,
 )
+from .claim_frames import (
+    ClaimFrame,
+    ClaimModifier,
+    ClaimRelation,
+    ClaimSpan,
+    ParsedClaimFrameBuilder,
+    SignalClaimFrameProducer,
+)
 from .pipeline import AutoGraphBuilder
 from .structural import DoclingStructuralEnricher, ElementStructuralAnnotation, StructuralEnrichmentResult
 
@@ -94,6 +112,10 @@ __all__ = [
     "BoundarySignals",
     "BuilderConfig",
     "CandidateSupport",
+    "ClaimFrame",
+    "ClaimModifier",
+    "ClaimRelation",
+    "ClaimSpan",
     "ChunkAuditExporter",
     "ChunkAuditRow",
     "ChunkRepairDecision",
@@ -134,6 +156,14 @@ __all__ = [
     "NodeCandidate",
     "NodeCandidateBuilder",
     "PropositionQueryTimeEvidenceAssembler",
+    "PropositionNeedHint",
+    "ParsedClaimFrameBuilder",
+    "QueryContext",
+    "QueryNeed",
+    "QueryNeedPackage",
+    "QueryNeedResolver",
+    "QueryNeedSupport",
+    "QueryNeedTraceStep",
     "QueryAssembledPackage",
     "QueryAssemblyDecision",
     "QueryEvidenceProposition",
@@ -148,12 +178,14 @@ __all__ = [
     "ResolutionTraceStep",
     "SlotCandidate",
     "SourceRef",
+    "SignalClaimFrameProducer",
     "StructuralEnrichmentResult",
     "SupportVerifier",
     "TermCandidate",
     "TentativeBlock",
     "TermMention",
     "default_prompt_cases",
+    "build_query_context",
     "evaluate_prompt_case",
     "evaluate_prompt_suite",
     "evaluate_retrieval_collection",

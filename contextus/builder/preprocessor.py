@@ -26,9 +26,14 @@ class ElementPreprocessor:
             else:
                 text = raw_text
         elif element_type == "formula":
-            latex = self._formula_latex(content)
-            readable = self._latex_to_readable(latex or raw_text)
-            text = f"Formula: {readable}" if readable else ""
+            if isinstance(content, str) and content.strip():
+                text = content.strip()
+                if not text.lower().startswith("formula:"):
+                    text = f"Formula: {text}"
+            else:
+                latex = self._formula_latex(content)
+                readable = self._latex_to_readable(latex or raw_text)
+                text = f"Formula: {readable}" if readable else ""
         elif element_type == "table":
             text = self._table_to_text(content)
         elif element_type in {"figure", "image", "chart", "diagram", "flowchart"}:

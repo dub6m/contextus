@@ -668,6 +668,11 @@ class DependencyResolver:
         for candidate in document_frames:
             for candidate_slot_name, candidate_slot in candidate.slots.items():
                 if _same_slot_target(source_slot, candidate_slot):
+                    proof_rejection = _proof_rejection_reason(source_frame=source_frame, candidate_frame=candidate)
+                    if proof_rejection:
+                        rejected_frame_ids.append(candidate.frame_id)
+                        rejected_parts.append(f"{candidate.frame_id}: {proof_rejection}")
+                        continue
                     if not _candidate_adds_information(
                         source_slot=source_slot,
                         source_frame=source_frame,
@@ -782,6 +787,40 @@ def _constraint_covers(required: FrameConstraint, candidate: FrameConstraint) ->
     if required.operator == "constant_bound":
         return candidate.operator in {"<", "<=", "="} and candidate.value_kind == "constant"
     return False
+
+
+ROUTE_PREDICATES = frozenset(
+    {
+        "adjacent_to",
+        "caption_of",
+        "heading_of",
+        "references",
+        "same_list",
+        "same_section",
+    }
+)
+
+STRICT_PROOF_FAMILIES = {
+    "definition": frozenset({"definition"}),
+    "procedure_step": frozenset({"procedure_step"}),
+    "bound": frozenset({"bound", "quantity_bound"}),
+    "quantity_bound": frozenset({"bound", "quantity_bound"}),
+    "contrast": frozenset({"contrast"}),
+    "shows": frozenset({"shows", "caption_claim", "supports_claim"}),
+    "caption_claim": frozenset({"shows", "caption_claim", "supports_claim"}),
+    "supports_claim": frozenset({"shows", "caption_claim", "supports_claim"}),
+}
+
+
+def _proof_rejection_reason(*, source_frame: FactFrame, candidate_frame: FactFrame) -> str:
+    candidate_predicate = normalize_term_text(candidate_frame.predicate)
+    if candidate_predicate in ROUTE_PREDICATES or candidate_frame.extraction_status == "syntax_route":
+        return "route frame cannot prove a dependency"
+    source_predicate = normalize_term_text(source_frame.predicate)
+    accepted = STRICT_PROOF_FAMILIES.get(source_predicate)
+    if accepted is not None and candidate_predicate not in accepted:
+        return "predicate family mismatch"
+    return ""
 
 
 def _candidate_adds_information(

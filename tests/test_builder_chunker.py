@@ -387,6 +387,30 @@ def test_proposition_response_parser_accepts_array_and_empty_propositions():
     assert chunker._parse_proposition_response("not json") is None
 
 
+def test_proposition_generation_prompt_states_standalone_quality_contract():
+    chunker = make_chunker()
+
+    prompt = chunker._proposition_generation_prompt(
+        [
+            make_boundary_view("title", "Closest Pair of Points in the Plane", 0),
+            make_boundary_view(
+                "body",
+                "Our goal here is to present an algorithm which solves the problem in time O(n log n).",
+                1,
+            ),
+        ]
+    )
+
+    assert "A perfect proposition is a standalone document fact" in prompt
+    assert "For title-only content, return the title itself" in prompt
+    assert "Bad: The document title is Closest Pair" in prompt
+    assert "Bad: Element of type formula on page 3" in prompt
+    assert "For goal, plan, or presentation-roadmap sentences" in prompt
+    assert "A weak subject only describes how information is being presented" in prompt
+    assert "[The weak presentation subject was removed." in prompt
+    assert "Preserve symbols" in prompt
+
+
 def test_proposition_walk_uses_cache_for_repeated_block_generation():
     llm = QueueLLM(
         '{"elements":['

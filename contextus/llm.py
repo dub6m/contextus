@@ -317,7 +317,7 @@ class CerebrasClient(LLMClient):
 class OpenAIResponsesClient(LLMClient):
     """OpenAI Responses API client with optional image input support."""
 
-    MODEL = "gpt-5-nano"
+    MODEL = "gpt-5-mini"
 
     def __init__(
         self,

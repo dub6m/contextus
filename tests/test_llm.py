@@ -229,6 +229,10 @@ def test_openai_responses_client_extracts_message_content_text():
     assert text == "json result"
 
 
+def test_openai_responses_client_defaults_to_gpt5_mini():
+    assert OpenAIResponsesClient.MODEL == "gpt-5-mini"
+
+
 class FakeOpenAIResponse:
     def __init__(self, payload):
         self._payload = payload

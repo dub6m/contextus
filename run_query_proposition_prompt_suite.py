@@ -13,7 +13,12 @@ from typing import Any, Callable
 import numpy as np
 from dotenv import load_dotenv
 
-from contextus.builder import BuilderConfig, ConsensusKnnPropositionEvidenceAssembler, CrossEncoderNliSupportVerifier
+from contextus.builder import (
+    BuilderConfig,
+    ConsensusKnnPropositionEvidenceAssembler,
+    CrossEncoderNliSupportVerifier,
+    PropositionNeedHint,
+)
 from contextus.builder.query_assembly import (
     PropositionQueryTimeEvidenceAssembler,
     PropositionRoleHypothesis,
@@ -96,11 +101,18 @@ def main() -> None:
                 "prompt": case.prompt,
                 "assembly_seconds": round(elapsed, 4),
                 "package_count": len(result.packages),
-                "packages": [package_summary(rank, package) for rank, package in enumerate(result.packages[:5], start=1)],
+                "packages": [
+                    package_summary(rank, package)
+                    for rank, package in enumerate(result.packages[:5], start=1)
+                ],
                 "answer_bundle": answer_bundle_summary(result.answer_bundle),
                 "dependency_packages": [
                     dependency_package_summary(rank, package)
                     for rank, package in enumerate(result.dependency_packages, start=1)
+                ],
+                "query_need_packages": [
+                    query_need_package_summary(rank, package)
+                    for rank, package in enumerate(result.query_need_packages, start=1)
                 ],
                 "source_traversal_answer_bundle": source_traversal_answer_bundle_summary(
                     result.source_traversal_answer_bundle
@@ -171,6 +183,30 @@ def main() -> None:
                     }
                     for case in cases
                 },
+                "query_need_packages": {
+                    case["case_id"]: {
+                        "package_count": len(case.get("query_need_packages", []))
+                        if isinstance(case.get("query_need_packages"), list)
+                        else 0,
+                        "selected_elements": [
+                            element
+                            for package in case.get("query_need_packages", [])
+                            if isinstance(package, dict)
+                            for element in package.get("selected_elements", [])
+                        ],
+                        "resolved_need_count": sum(
+                            int(package.get("resolved_need_count", 0))
+                            for package in case.get("query_need_packages", [])
+                            if isinstance(package, dict)
+                        ),
+                        "unresolved_need_count": sum(
+                            int(package.get("unresolved_need_count", 0))
+                            for package in case.get("query_need_packages", [])
+                            if isinstance(package, dict)
+                        ),
+                    }
+                    for case in cases
+                },
                 "top_packages": {
                     case["case_id"]: {
                         "package_id": case["packages"][0]["package_id"] if case["packages"] else None,
@@ -216,6 +252,12 @@ def make_assembler(
         dependency_resolver_depth=int(os.environ.get("QUERY_DEPENDENCY_RESOLVER_DEPTH", "2")),
         dependency_resolver_max_frames=int(os.environ.get("QUERY_DEPENDENCY_RESOLVER_MAX_FRAMES", "32")),
         dependency_support_verifier=support_verifier,
+        use_query_need_resolver=env_flag("QUERY_NEED_RESOLVER"),
+        query_need_max_depth=int(os.environ.get("QUERY_NEED_RESOLVER_DEPTH", "1")),
+        query_need_max_active=int(os.environ.get("QUERY_NEED_RESOLVER_MAX_ACTIVE", "4")),
+        query_need_max_supports_per_need=int(os.environ.get("QUERY_NEED_RESOLVER_SUPPORTS_PER_NEED", "1")),
+        query_need_min_support_score=float(os.environ.get("QUERY_NEED_RESOLVER_MIN_SCORE", "0.34")),
+        query_need_max_selected_supports=int(os.environ.get("QUERY_NEED_RESOLVER_MAX_SUPPORTS", "8")),
     )
 
 
@@ -386,7 +428,22 @@ def warm_proposition_cache(
                 for role in raw.get("roles") or []
                 if isinstance(role, dict)
             ]
-            drafts_by_element.setdefault(element_id, []).append(_PropositionDraft(text=text, roles=roles))
+            possible_needs = [
+                PropositionNeedHint(
+                    kind=str(need.get("kind") or "").strip().lower(),
+                    question=str(need.get("question") or "").strip(),
+                    target=str(need.get("target") or "").strip(),
+                    expected_support=tuple(str(item).strip() for item in need.get("expected_support") or [] if str(item).strip()),
+                    anchor_terms=tuple(str(item).strip() for item in need.get("anchor_terms") or [] if str(item).strip()),
+                    confidence=float(need.get("confidence") or 0.0),
+                    reason=str(need.get("reason") or "").strip(),
+                )
+                for need in raw.get("possible_needs") or []
+                if isinstance(need, dict)
+            ]
+            drafts_by_element.setdefault(element_id, []).append(
+                _PropositionDraft(text=text, roles=roles, possible_needs=possible_needs)
+            )
 
         warmed = 0
         for signal in signals:
@@ -533,6 +590,63 @@ def dependency_package_summary(rank: int, package: object) -> dict[str, object]:
     }
 
 
+def query_need_package_summary(rank: int, package: object) -> dict[str, object]:
+    query_context = getattr(package, "query_context", None)
+    return {
+        "rank": rank,
+        "core_proposition_id": getattr(package, "core_proposition_id", ""),
+        "core_element_id": getattr(package, "core_element_id", ""),
+        "query_context": asdict(query_context) if query_context is not None else {},
+        "selected_proposition_ids": list(getattr(package, "selected_proposition_ids", [])),
+        "selected_elements": list(getattr(package, "selected_elements", [])),
+        "active_need_count": len(getattr(package, "active_needs", [])),
+        "resolved_need_count": len(getattr(package, "resolved_needs", [])),
+        "unresolved_need_count": len(getattr(package, "unresolved_needs", [])),
+        "active_needs": [query_need_summary(need) for need in getattr(package, "active_needs", [])][:12],
+        "unresolved_needs": [query_need_summary(need) for need in getattr(package, "unresolved_needs", [])][:12],
+        "selected_supports": [
+            {
+                "need_id": getattr(support, "need_id", ""),
+                "proposition_id": getattr(support, "proposition_id", ""),
+                "element_id": getattr(support, "element_id", ""),
+                "score": round(float(getattr(support, "score", 0.0)), 4),
+                "semantic_score": round(float(getattr(support, "semantic_score", 0.0)), 4),
+                "matched_terms": list(getattr(support, "matched_terms", [])),
+                "matched_expectations": list(getattr(support, "matched_expectations", [])),
+                "search_question": getattr(support, "search_question", ""),
+                "reason": getattr(support, "reason", ""),
+            }
+            for support in getattr(package, "selected_supports", [])
+        ][:16],
+        "trace": [
+            {
+                "action": getattr(step, "action", ""),
+                "need_id": getattr(step, "need_id", ""),
+                "proposition_id": getattr(step, "proposition_id", ""),
+                "score": round(float(getattr(step, "score", 0.0)), 4),
+                "reason": getattr(step, "reason", ""),
+            }
+            for step in getattr(package, "trace", [])
+        ][:24],
+    }
+
+
+def query_need_summary(need: object) -> dict[str, object]:
+    return {
+        "need_id": getattr(need, "need_id", ""),
+        "kind": getattr(need, "kind", ""),
+        "question": getattr(need, "question", ""),
+        "target": getattr(need, "target", ""),
+        "expected_support": list(getattr(need, "expected_support", [])),
+        "anchor_terms": list(getattr(need, "anchor_terms", [])),
+        "search_questions": list(getattr(need, "search_questions", [])),
+        "depth": getattr(need, "depth", 0),
+        "parent_need_id": getattr(need, "parent_need_id", ""),
+        "status": getattr(need, "status", ""),
+        "reason": getattr(need, "reason", ""),
+    }
+
+
 def source_traversal_answer_bundle_summary(answer_bundle: object) -> dict[str, object] | None:
     if answer_bundle is None:
         return None
@@ -639,6 +753,12 @@ def assembler_settings(assembler: PropositionQueryTimeEvidenceAssembler) -> dict
         "dependency_support_verifier": type(getattr(assembler, "dependency_support_verifier", None)).__name__
         if getattr(assembler, "dependency_support_verifier", None) is not None
         else None,
+        "use_query_need_resolver": getattr(assembler, "use_query_need_resolver", None),
+        "query_need_max_depth": getattr(assembler, "query_need_max_depth", None),
+        "query_need_max_active": getattr(assembler, "query_need_max_active", None),
+        "query_need_max_supports_per_need": getattr(assembler, "query_need_max_supports_per_need", None),
+        "query_need_min_support_score": getattr(assembler, "query_need_min_support_score", None),
+        "query_need_max_selected_supports": getattr(assembler, "query_need_max_selected_supports", None),
         "relation_geometry_weight": getattr(assembler, "relation_geometry_weight", None),
         "relation_family_similarity": getattr(assembler, "relation_family_similarity", None),
         "min_relation_family_size": getattr(assembler, "min_relation_family_size", None),
@@ -722,6 +842,70 @@ def render_markdown(diagnostics: dict[str, object], cases: list[dict[str, object
                         lines.append(
                             f"- `{step.get('action', '')}` `{join_list(step.get('frame_ids'))}`: "
                             f"{step.get('reason', '')}"
+                        )
+                lines.append("")
+        query_need_packages = case.get("query_need_packages", [])
+        if isinstance(query_need_packages, list) and query_need_packages:
+            lines.append("### Query Need Resolver Packages")
+            lines.append("")
+            for package in query_need_packages:
+                if not isinstance(package, dict):
+                    continue
+                context = package.get("query_context") if isinstance(package.get("query_context"), dict) else {}
+                lines.append(f"#### Query Need Package {package.get('rank')}")
+                lines.append("")
+                lines.append(f"- Core proposition: `{package.get('core_proposition_id', '')}`")
+                lines.append(f"- Core element: `{package.get('core_element_id', '')}`")
+                lines.append(f"- Query type: `{context.get('query_type', '')}`")
+                lines.append(f"- Desired shape: `{context.get('desired_answer_shape', '')}`")
+                lines.append(f"- Selected elements: `{join_list(package.get('selected_elements'))}`")
+                lines.append(f"- Active needs: `{package.get('active_need_count', 0)}`")
+                lines.append(f"- Resolved needs: `{package.get('resolved_need_count', 0)}`")
+                lines.append(f"- Unresolved needs: `{package.get('unresolved_need_count', 0)}`")
+                active_needs = package.get("active_needs", [])
+                if isinstance(active_needs, list) and active_needs:
+                    lines.append("")
+                    lines.append("Active needs:")
+                    lines.append("")
+                    for need in active_needs[:6]:
+                        if not isinstance(need, dict):
+                            continue
+                        lines.append(
+                            f"- `{need.get('kind', '')}` {need.get('question', '')} "
+                            f"[target: {need.get('target', '')}]"
+                        )
+                selected_supports = package.get("selected_supports", [])
+                if isinstance(selected_supports, list) and selected_supports:
+                    lines.append("")
+                    lines.append("Selected supports:")
+                    lines.append("")
+                    for support in selected_supports[:8]:
+                        if not isinstance(support, dict):
+                            continue
+                        lines.append(
+                            f"- `{support.get('element_id', '')}` score `{support.get('score', '')}` "
+                            f"for `{support.get('need_id', '')}`: {support.get('reason', '')}"
+                        )
+                unresolved_needs = package.get("unresolved_needs", [])
+                if isinstance(unresolved_needs, list) and unresolved_needs:
+                    lines.append("")
+                    lines.append("Unresolved:")
+                    lines.append("")
+                    for need in unresolved_needs[:6]:
+                        if not isinstance(need, dict):
+                            continue
+                        lines.append(f"- `{need.get('kind', '')}` {need.get('question', '')}")
+                trace = package.get("trace", [])
+                if isinstance(trace, list) and trace:
+                    lines.append("")
+                    lines.append("Trace preview:")
+                    lines.append("")
+                    for step in trace[:8]:
+                        if not isinstance(step, dict):
+                            continue
+                        lines.append(
+                            f"- `{step.get('action', '')}` `{step.get('proposition_id', '')}` "
+                            f"score `{step.get('score', '')}`: {step.get('reason', '')}"
                         )
                 lines.append("")
         traversal_packages = case.get("source_traversal_packages", [])

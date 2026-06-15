@@ -787,6 +787,133 @@ def test_resolver_uses_verifier_to_reject_structural_slot_match():
     assert any("verifier rejected" in step.reason for step in result.resolution_trace)
 
 
+def test_resolver_rejects_route_frame_as_proof_even_with_same_target():
+    term_index = DocumentTermIndex.from_candidates(
+        [
+            _term_candidate("core", "Closest pair problem needs definition.", "Closest pair problem"),
+            _term_candidate("route", "Closest pair problem section heading.", "Closest pair problem"),
+        ]
+    )
+    core_frame, route_frame = FrameCandidateProjector(term_index).project(
+        [
+            FrameCandidate(
+                frame_id="frame:core",
+                element_id="core",
+                proposition_id="core::p00",
+                predicate="definition",
+                slots={
+                    "target": _slot_candidate(
+                        "target",
+                        "Closest pair problem needs definition.",
+                        "Closest pair problem",
+                    )
+                },
+            ),
+            FrameCandidate(
+                frame_id="frame:route",
+                element_id="route",
+                proposition_id="route::p00",
+                predicate="heading_of",
+                slots={
+                    "target": _slot_candidate(
+                        "target",
+                        "Closest pair problem section heading.",
+                        "Closest pair problem",
+                    ),
+                    "section": _slot_candidate(
+                        "section",
+                        "Closest pair problem section heading.",
+                        "section heading",
+                        grounding_state="grounded",
+                    ),
+                },
+            ),
+        ]
+    )
+
+    result = DependencyResolver().resolve(core_frames=[core_frame], document_frames=[route_frame])
+
+    assert not result.resolved_needs
+    assert result.unresolved_needs
+    assert not result.selected_frames
+    assert any("route frame cannot prove" in step.reason for step in result.resolution_trace)
+
+
+def test_resolver_requires_same_predicate_family_for_definition_support():
+    term_index = DocumentTermIndex.from_candidates(
+        [
+            _term_candidate("core", "Closest pair problem needs definition.", "Closest pair problem"),
+            _term_candidate("procedure", "Closest pair problem splits points recursively.", "Closest pair problem"),
+            _term_candidate("procedure", "Closest pair problem splits points recursively.", "splits points recursively"),
+            _term_candidate("definition", "Closest pair problem means finding closest points.", "Closest pair problem"),
+            _term_candidate("definition", "Closest pair problem means finding closest points.", "finding closest points"),
+        ]
+    )
+    core_frame, procedure_frame, definition_frame = FrameCandidateProjector(term_index).project(
+        [
+            FrameCandidate(
+                frame_id="frame:core",
+                element_id="core",
+                proposition_id="core::p00",
+                predicate="definition",
+                slots={
+                    "target": _slot_candidate(
+                        "target",
+                        "Closest pair problem needs definition.",
+                        "Closest pair problem",
+                    )
+                },
+            ),
+            FrameCandidate(
+                frame_id="frame:procedure",
+                element_id="procedure",
+                proposition_id="procedure::p00",
+                predicate="procedure_step",
+                slots={
+                    "target": _slot_candidate(
+                        "target",
+                        "Closest pair problem splits points recursively.",
+                        "Closest pair problem",
+                    ),
+                    "step": _slot_candidate(
+                        "step",
+                        "Closest pair problem splits points recursively.",
+                        "splits points recursively",
+                        grounding_state="grounded",
+                    ),
+                },
+            ),
+            FrameCandidate(
+                frame_id="frame:definition",
+                element_id="definition",
+                proposition_id="definition::p00",
+                predicate="definition",
+                slots={
+                    "target": _slot_candidate(
+                        "target",
+                        "Closest pair problem means finding closest points.",
+                        "Closest pair problem",
+                    ),
+                    "value": _slot_candidate(
+                        "value",
+                        "Closest pair problem means finding closest points.",
+                        "finding closest points",
+                        grounding_state="grounded",
+                    ),
+                },
+            ),
+        ]
+    )
+
+    result = DependencyResolver().resolve(
+        core_frames=[core_frame],
+        document_frames=[procedure_frame, definition_frame],
+    )
+
+    assert [frame.frame_id for frame in result.selected_frames] == ["frame:definition"]
+    assert any("predicate family mismatch" in step.reason for step in result.resolution_trace)
+
+
 def test_resolver_recursively_resolves_selected_support_frame_needs():
     term_index = DocumentTermIndex.from_candidates(
         [

@@ -26,6 +26,12 @@ from .dependency_resolver import (
 )
 from .evidence import ElementSignalRecord, EvidenceHandleBuilder
 from .preprocessor import ElementPreprocessor
+from .query_needs import (
+    PropositionNeedHint,
+    QueryNeedPackage,
+    QueryNeedResolver,
+    build_query_context,
+)
 
 
 SUPPORT_ELEMENT_TYPES = {"figure", "image", "chart", "diagram", "flowchart", "table", "formula"}
@@ -91,11 +97,13 @@ COMPLETION_NOISE_TERMS = {
     "list",
     "make",
     "most",
+    "nd",
     "our",
     "same",
     "set",
     "time",
     "two",
+    "us",
     "use",
     "used",
     "we",
@@ -374,6 +382,7 @@ class QueryAssemblyResult:
     propositions: list["QueryEvidenceProposition"] = field(default_factory=list)
     retrieval_plan: "QueryRetrievalPlan | None" = None
     dependency_packages: list[ResolvedPackage] = field(default_factory=list)
+    query_need_packages: list[QueryNeedPackage] = field(default_factory=list)
     answer_bundle: QueryAnswerBundle | None = None
     source_traversals: list[SourceTraversalTrace] = field(default_factory=list)
     source_traversal_packages: list[QueryAssembledPackage] = field(default_factory=list)
@@ -427,6 +436,7 @@ class QueryEvidenceProposition:
     support_element_ids: list[str] = field(default_factory=list)
     roles: list["PropositionRoleHypothesis"] = field(default_factory=list)
     grounding: "PropositionGroundingDiagnostics | None" = None
+    possible_needs: list[PropositionNeedHint] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -470,6 +480,7 @@ class PropositionGroundingDiagnostics:
 class _PropositionDraft:
     text: str
     roles: list[PropositionRoleHypothesis] = field(default_factory=list)
+    possible_needs: list[PropositionNeedHint] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1692,7 +1703,7 @@ class QueryTimeEvidenceAssembler:
 class PropositionQueryTimeEvidenceAssembler(QueryTimeEvidenceAssembler):
     """Select query cores from generated propositions, then return source-backed packages."""
 
-    PROPOSITION_PROMPT_VERSION = "query_proposition_assembly_v2_roles"
+    PROPOSITION_PROMPT_VERSION = "query_proposition_assembly_v3_repair_buckets"
 
     def __init__(
         self,
@@ -1705,6 +1716,9 @@ class PropositionQueryTimeEvidenceAssembler(QueryTimeEvidenceAssembler):
         self.llm_client = llm_client
         self.proposition_batch_size = max(1, int(proposition_batch_size))
         self._proposition_cache: dict[str, list[_PropositionDraft]] = {}
+        self.proposition_repair_items: list[dict[str, str]] = []
+        self.proposition_repaired_items: list[dict[str, str]] = []
+        self.proposition_omitted_items: list[dict[str, str]] = []
 
     def assemble(self, document: ExtractedDocument, prompt: str) -> QueryAssemblyResult:
         pipeline = self._signal_builder.build(document)
@@ -1825,7 +1839,11 @@ class PropositionQueryTimeEvidenceAssembler(QueryTimeEvidenceAssembler):
 
         propositions: list[QueryEvidenceProposition] = []
         for signal_index, signal in enumerate(signals):
-            drafts = by_element.get(signal.element_id) or self._fallback_propositions(signal)
+            drafts = (
+                by_element[signal.element_id]
+                if signal.element_id in by_element
+                else self._fallback_propositions(signal)
+            )
             for index, draft in enumerate(drafts):
                 proposition_text, support_refs = self._split_support_refs(draft.text, support_ids=support_ids)
                 if not proposition_text:
@@ -1844,6 +1862,7 @@ class PropositionQueryTimeEvidenceAssembler(QueryTimeEvidenceAssembler):
                             roles=draft.roles,
                             support_element_ids=support_refs,
                         ),
+                        possible_needs=draft.possible_needs,
                     )
                 )
         return propositions
@@ -1855,17 +1874,28 @@ class PropositionQueryTimeEvidenceAssembler(QueryTimeEvidenceAssembler):
         *,
         all_signals: list[ElementSignalRecord],
     ) -> None:
+        repair_start = len(self.proposition_repair_items)
         batches = [
             missing[index : index + self.proposition_batch_size]
             for index in range(0, len(missing), self.proposition_batch_size)
         ]
+        batch_by_element = {
+            signal.element_id: batch_index
+            for batch_index, batch in enumerate(batches)
+            for signal in batch
+        }
+        naming_context = self._document_naming_context(all_signals)
         requests = [
             LLMRequest(
                 system=(
                     "You decompose document content into source-faithful standalone propositions. "
                     "Return only JSON matching the requested schema."
                 ),
-                user=self._proposition_generation_prompt(batch, all_signals=all_signals),
+                user=self._proposition_generation_prompt(
+                    batch,
+                    all_signals=all_signals,
+                    naming_context=naming_context,
+                ),
                 temperature=0.0,
                 response_format=self._proposition_response_format(),
             )
@@ -1877,27 +1907,402 @@ class PropositionQueryTimeEvidenceAssembler(QueryTimeEvidenceAssembler):
             if parsed is None:
                 parsed = {}
             for signal in batch:
-                propositions = parsed.get(signal.element_id) or self._fallback_propositions(signal)
+                propositions = (
+                    parsed[signal.element_id]
+                    if signal.element_id in parsed
+                    else self._fallback_propositions(signal)
+                )
                 cleaned = self._clean_propositions(propositions)
+                cleaned = self._filter_grounded_generated_propositions(signal=signal, propositions=cleaned)
                 by_element[signal.element_id] = cleaned
                 self._proposition_cache[self._proposition_cache_key(signal)] = cleaned
+        repair_items = [
+            item
+            for item in self.proposition_repair_items[repair_start:]
+            if item.get("element_id", "") in batch_by_element
+        ]
+        if repair_items:
+            self._repair_generated_propositions(
+                repair_items=repair_items,
+                batches=batches,
+                by_element=by_element,
+                all_signals=all_signals,
+                naming_context=naming_context,
+            )
+
+    def _repair_generated_propositions(
+        self,
+        *,
+        repair_items: list[dict[str, str]],
+        batches: list[list[ElementSignalRecord]],
+        by_element: dict[str, list[_PropositionDraft]],
+        all_signals: list[ElementSignalRecord],
+        naming_context: str,
+    ) -> None:
+        if self.llm_client is None:
+            return
+        batch_by_element = {
+            signal.element_id: batch_index
+            for batch_index, batch in enumerate(batches)
+            for signal in batch
+        }
+        grouped: dict[int, list[dict[str, str]]] = defaultdict(list)
+        for item in repair_items:
+            element_id = item.get("element_id", "")
+            if element_id in batch_by_element:
+                grouped[batch_by_element[element_id]].append(item)
+        if not grouped:
+            return
+
+        requests: list[LLMRequest] = []
+        request_batches: list[tuple[int, list[dict[str, str]]]] = []
+        for batch_index in sorted(grouped):
+            batch_items = grouped[batch_index]
+            requests.append(
+                LLMRequest(
+                    system=(
+                        "You repair unresolved proposition drafts into source-faithful standalone propositions. "
+                        "Return only JSON matching the requested schema."
+                    ),
+                    user=self._proposition_repair_prompt(
+                        repair_items=batch_items,
+                        batch_index=batch_index,
+                        batches=batches,
+                        by_element=by_element,
+                        naming_context=naming_context,
+                    ),
+                    temperature=0.0,
+                    response_format=self._proposition_response_format(),
+                )
+            )
+            request_batches.append((batch_index, batch_items))
+
+        responses = self.llm_client.complete_many(requests)
+        signal_by_element_id = {signal.element_id: signal for signal in all_signals}
+        for (_batch_index, batch_items), response in zip(request_batches, responses):
+            parsed = self._parse_proposition_response(getattr(response, "content", str(response)))
+            if parsed is None:
+                continue
+            for item in batch_items:
+                element_id = item.get("element_id", "")
+                signal = signal_by_element_id.get(element_id)
+                if signal is None or element_id not in parsed:
+                    continue
+                repaired = self._clean_propositions(parsed[element_id])
+                repaired = self._filter_grounded_generated_propositions(
+                    signal=signal,
+                    propositions=repaired,
+                    allow_fallback=False,
+                )
+                existing = list(by_element.get(element_id, []))
+                accepted_repairs: list[_PropositionDraft] = []
+                existing_keys = {_completion_normalized_text(draft.text) for draft in existing}
+                for draft in repaired:
+                    rejection_reason = self._repair_candidate_rejection_reason(
+                        signal=signal,
+                        draft=draft,
+                        existing_keys=existing_keys,
+                    )
+                    if rejection_reason:
+                        self.proposition_repair_items.append(
+                            {
+                                "element_id": element_id,
+                                "source_fragment": draft.text,
+                                "missing_context": rejection_reason,
+                                "repair_hint": "Keep this item in the repair queue until stronger source context is available.",
+                            }
+                        )
+                        continue
+                    existing_keys.add(_completion_normalized_text(draft.text))
+                    accepted_repairs.append(draft)
+                if not accepted_repairs:
+                    continue
+                existing.extend(accepted_repairs)
+                by_element[element_id] = existing
+                self._proposition_cache[self._proposition_cache_key(signal)] = existing
+                for draft in accepted_repairs:
+                    self.proposition_repaired_items.append(
+                        {
+                            "element_id": element_id,
+                            "source_fragment": item.get("source_fragment", ""),
+                            "text": draft.text,
+                        }
+                    )
+
+    def _repair_candidate_rejection_reason(
+        self,
+        *,
+        signal: ElementSignalRecord,
+        draft: _PropositionDraft,
+        existing_keys: set[str],
+    ) -> str:
+        normalized = _completion_normalized_text(draft.text)
+        if normalized in existing_keys:
+            return "The repaired proposition duplicates an already accepted proposition."
+        diagnostics = self._ground_proposition(
+            signal=signal,
+            proposition_text=draft.text,
+            roles=draft.roles,
+            support_element_ids=[],
+        )
+        if diagnostics.severity == "ungrounded":
+            return "The repaired proposition is not grounded in the original element."
+        if diagnostics.severity == "weak" and len(diagnostics.novel_terms) > 3:
+            return "The repaired proposition adds too many terms that are not grounded in the original element."
+        return ""
+
+    def _proposition_repair_prompt(
+        self,
+        *,
+        repair_items: list[dict[str, str]],
+        batch_index: int,
+        batches: list[list[ElementSignalRecord]],
+        by_element: dict[str, list[_PropositionDraft]],
+        naming_context: str,
+    ) -> str:
+        batch = batches[batch_index]
+        repair_lines: list[str] = []
+        for item_index, item in enumerate(repair_items, start=1):
+            repair_lines.extend(
+                [
+                    f"Repair Item {item_index}",
+                    f"Element ID: {item.get('element_id', '')}",
+                    f"Source fragment: {item.get('source_fragment', '')}",
+                    f"Missing context: {item.get('missing_context', '')}",
+                    f"Repair hint: {item.get('repair_hint', '')}",
+                    "",
+                ]
+            )
+
+        source_lines: list[str] = []
+        for signal in batch:
+            text = signal.text.strip()
+            if len(text) > 1600:
+                text = text[:1597].rstrip() + "..."
+            source_lines.extend(
+                [
+                    f"Element ID: {signal.element_id}",
+                    f"Type: {signal.element_type}",
+                    f"Page: {signal.page_number}",
+                    f"Heading Path: {self._proposition_heading_context(signal) or 'None'}",
+                    f"Content: {text}",
+                    "",
+                ]
+            )
+
+        return "\n".join(
+            [
+                "Repair only the listed repair items when enough context is available.",
+                "Use the original source batch as direct source context.",
+                "Use accepted propositions from the same and neighboring batches only to resolve references and naming.",
+                "Neighboring source context may resolve names and references, but the repaired proposition must only state the fact supported by the repair item's own Element ID.",
+                "Do not add descriptive details from neighboring elements unless those details are necessary to replace an unresolved reference.",
+                "Use the shortest resolved name that makes the proposition standalone.",
+                "Do not create a repaired proposition whose core fact belongs to another element.",
+                "Do not invent missing facts, placeholder subjects, or unresolved referents.",
+                "If a repair item still cannot become standalone and grounded, put it in needs_repair or omitted.",
+                "",
+                "Repair Items:",
+                "\n".join(repair_lines).strip() or "None.",
+                "",
+                "Original Source Batch:",
+                "\n".join(source_lines).strip() or "None.",
+                "",
+                "Accepted Propositions From Same Batch:",
+                self._accepted_proposition_context(
+                    batch_indices=[batch_index],
+                    batches=batches,
+                    by_element=by_element,
+                    limit_per_batch=None,
+                )
+                or "None.",
+                "",
+                "Source Elements From Neighboring Batches:",
+                self._source_batch_context(
+                    batch_indices=[batch_index - 1, batch_index + 1],
+                    batches=batches,
+                    limit_per_batch=12,
+                )
+                or "None.",
+                "",
+                "Accepted Propositions From Neighboring Batches:",
+                self._accepted_proposition_context(
+                    batch_indices=[batch_index - 1, batch_index + 1],
+                    batches=batches,
+                    by_element=by_element,
+                    limit_per_batch=12,
+                )
+                or "None.",
+                "",
+                "Document Naming Context:",
+                naming_context or "None.",
+                "",
+                "Return one entry for every Element ID represented in Repair Items.",
+                "Each entry must contain element_id, accepted, needs_repair, and omitted.",
+            ]
+        )
+
+    def _source_batch_context(
+        self,
+        *,
+        batch_indices: list[int],
+        batches: list[list[ElementSignalRecord]],
+        limit_per_batch: int | None,
+    ) -> str:
+        lines: list[str] = []
+        for batch_index in batch_indices:
+            if batch_index < 0 or batch_index >= len(batches):
+                continue
+            batch_lines: list[str] = []
+            for signal in batches[batch_index]:
+                text = re.sub(r"\s+", " ", signal.text).strip()
+                if len(text) > 700:
+                    text = text[:697].rstrip() + "..."
+                heading_context = self._proposition_heading_context(signal)
+                batch_lines.append(
+                    " | ".join(
+                        [
+                            f"Element ID: {signal.element_id}",
+                            f"Type: {signal.element_type}",
+                            f"Heading Path: {heading_context or 'None'}",
+                            f"Content: {text}",
+                        ]
+                    )
+                )
+            if limit_per_batch is not None:
+                batch_lines = batch_lines[:limit_per_batch]
+            if batch_lines:
+                lines.append(f"Batch {batch_index}:")
+                lines.extend(batch_lines)
+        return "\n".join(lines)
+
+    def _accepted_proposition_context(
+        self,
+        *,
+        batch_indices: list[int],
+        batches: list[list[ElementSignalRecord]],
+        by_element: dict[str, list[_PropositionDraft]],
+        limit_per_batch: int | None,
+    ) -> str:
+        lines: list[str] = []
+        for batch_index in batch_indices:
+            if batch_index < 0 or batch_index >= len(batches):
+                continue
+            batch_lines: list[str] = []
+            for signal in batches[batch_index]:
+                for draft in by_element.get(signal.element_id, []):
+                    batch_lines.append(f"- {signal.element_id}: {draft.text}")
+            if limit_per_batch is not None:
+                batch_lines = batch_lines[:limit_per_batch]
+            if batch_lines:
+                lines.append(f"Batch {batch_index}:")
+                lines.extend(batch_lines)
+        return "\n".join(lines)
+
+    def _filter_grounded_generated_propositions(
+        self,
+        *,
+        signal: ElementSignalRecord,
+        propositions: list[_PropositionDraft],
+        allow_fallback: bool = True,
+    ) -> list[_PropositionDraft]:
+        if not propositions:
+            return propositions
+        grounded = [
+            proposition
+            for proposition in propositions
+            if self._generated_proposition_text_is_grounded(signal=signal, proposition_text=proposition.text)
+        ]
+        non_meta = [
+            proposition
+            for proposition in grounded
+            if not self._generated_proposition_text_is_meta(proposition.text)
+        ]
+        accepted: list[_PropositionDraft] = []
+        for proposition in non_meta:
+            repair_reason = self._generated_proposition_repair_reason(proposition.text)
+            if repair_reason:
+                self.proposition_repair_items.append(
+                    {
+                        "element_id": signal.element_id,
+                        "source_fragment": proposition.text,
+                        "missing_context": repair_reason,
+                        "repair_hint": "Repair with surrounding accepted propositions and source context before accepting.",
+                    }
+                )
+                continue
+            accepted.append(proposition)
+        if accepted:
+            return accepted
+        if non_meta:
+            return []
+        if grounded:
+            return self._fallback_propositions(signal) if allow_fallback else []
+        return grounded or (self._fallback_propositions(signal) if allow_fallback else [])
+
+    def _generated_proposition_text_is_grounded(self, *, signal: ElementSignalRecord, proposition_text: str) -> bool:
+        diagnostics = self._ground_proposition(
+            signal=signal,
+            proposition_text=proposition_text,
+            roles=[],
+            support_element_ids=[],
+        )
+        return diagnostics.severity != "ungrounded"
+
+    def _generated_proposition_text_is_meta(self, proposition_text: str) -> bool:
+        normalized = _completion_normalized_text(proposition_text)
+        return bool(
+            re.match(
+                r"^(?:the\s+)?(?:document|text|sentence|author|authors|reader|readers|narrator)\b",
+                normalized,
+            )
+            or re.match(
+                r"^(?:an?\s+)?element\s+of\s+type\b",
+                normalized,
+            )
+        )
+
+    def _generated_proposition_repair_reason(self, proposition_text: str) -> str:
+        normalized = _completion_normalized_text(proposition_text)
+        if re.match(
+            r"^(?:this|that|these|those)(?:\s+\w+){0,2}\s+"
+            r"(?:step|claim|process|method|approach|procedure|result|case|example|argument|proof)\b",
+            normalized,
+        ) or re.match(r"^it\b", normalized):
+            return "The proposition still uses a local pointer as the subject."
+        if re.match(r"^(?:we|i)\b", normalized):
+            return "The proposition is still framed through the narrator rather than the document-native fact."
+        if re.match(r"^(?:the\s+)?(?:goal|purpose|aim|objective)\s+(?:is|was|here|of)\b", normalized):
+            return "The proposition still makes an abstract intention the subject instead of the named item."
+        if re.search(
+            r"\b(?:two|three|several|both|\d+)\s+(?:stated\s+|named\s+)?"
+            r"(?:assumptions|conditions|cases|steps|claims|facts|items)\b",
+            normalized,
+        ):
+            return "The proposition refers to a grouped set without naming the group members."
+        if re.search(r"\b(?:unspecified|unnamed|not\s+specified|not\s+named)\b", normalized):
+            return "The proposition contains a placeholder for missing context."
+        return ""
 
     def _proposition_generation_prompt(
         self,
         signals: list[ElementSignalRecord],
         *,
         all_signals: list[ElementSignalRecord] | None = None,
+        naming_context: str | None = None,
     ) -> str:
         lines: list[str] = []
         for signal in signals:
             text = signal.text.strip()
             if len(text) > 1600:
                 text = text[:1597].rstrip() + "..."
+            heading_context = self._proposition_heading_context(signal)
             lines.extend(
                 [
                     f"Element ID: {signal.element_id}",
                     f"Type: {signal.element_type}",
                     f"Page: {signal.page_number}",
+                    f"Heading Path: {heading_context or 'None'}",
                     f"Content: {text}",
                     "",
                 ]
@@ -1906,10 +2311,43 @@ class PropositionQueryTimeEvidenceAssembler(QueryTimeEvidenceAssembler):
         return "\n".join(
             [
                 'Decompose each "Content" into clear, simple, source-faithful propositions.',
+                "A perfect proposition is a standalone document fact: specific enough to be used later without reading the original sentence, but not broader than the source.",
                 "Each proposition must be interpretable out of context.",
+                "Each proposition should state one claim, action, definition, bound, condition, or source-backed relation.",
                 "Split compound content into separate propositions when useful.",
-                'Replace pronouns or vague references such as "this", "that", "it", "they", and "above" with the source referent when the referent is present in the content.',
+                "Replace pronouns or vague references with the source referent when the referent is available from the current Content, Heading Path, Nearby Support Context, or Document Naming Context.",
+                "Use the Heading Path only to clarify local references; do not invent facts from it.",
+                "Do not place a proposition under an Element ID unless that proposition is supported by that Element ID's Content, Heading Path, or explicit support context.",
+                "Do not move facts from one Element ID into another Element ID.",
+                "Use the subject that carries the actual document fact.",
+                "A strong subject is the document-native thing the fact is actually about: the object, claim, method, condition, result, definition, relation, symbol, quantity, or procedure supported by the source.",
+                "When the source describes how information will be presented, explained, introduced, organized, or argued, do not automatically make that presentation act the subject of the proposition.",
+                "First identify the source-backed item that the sentence is ultimately about. Make that document-native item the subject when it can be named from the current content or allowed local context.",
+                "When the sentence states an intention or objective and also names the intended object, result, method, condition, or bound, express the named item as carrying the intended status instead of making the intention itself the subject.",
+                "Keep the presentation act as the subject only when the presentation act itself is the source-backed fact, rather than a framing device for another fact.",
+                "An accepted proposition must not rely on a local pointer whose referent is still unnamed. If the proposition would still require the reader to know what the pointer refers to, put that fragment in needs_repair.",
+                "If a useful proposition depends on an unresolved reference, missing antecedent, unnamed subject, or incomplete local context, do not invent a placeholder subject and do not force the proposition into the accepted set.",
+                "Instead, put it in needs_repair and explain what context is missing.",
+                "Use omitted only when the source has no useful proposition, is purely navigational/noise, or cannot produce a useful proposition without inventing information.",
+                "For title-only content, return the title itself as the proposition; do not rewrite it as a fact about the document title.",
+                "Preserve symbols, variables, formulas, quantities, names, and bounds exactly when possible.",
+                "Procedure steps may remain imperative when the source is an algorithm, instruction, or ordered method.",
+                "Examples:",
+                "Bad: The section explains how the process works.",
+                "Good: Photosynthesis converts light energy into chemical energy.",
+                "Bad: The paragraph introduces the rule.",
+                "Good: A valid contract requires offer, acceptance, and consideration.",
+                "Bad: The lecture will show why this occurs.",
+                "Good: Air pressure decreases as altitude increases.",
+                "Bad: The aim is to improve prediction accuracy.",
+                "Good: The model is intended to improve prediction accuracy.",
+                "Bad: The source mentions an unspecified condition.",
+                "Good: Put the fragment in needs_repair if the condition cannot be named from the content or allowed local context.",
                 "For each proposition, include role hypotheses that describe what job the proposition plays in the document.",
+                "When an accepted proposition has obvious source-backed dependencies, include possible_needs.",
+                "A possible_need is a targeted missing-support question, not a broad topic. Keep it short and grounded in the current proposition.",
+                "Useful possible_need kinds include definition_support, bound_support, complexity_support, condition_support, procedure_support, proof_support, and source_support.",
+                "Only include possible_needs that a later query might need to resolve; omit speculative background needs.",
                 "Prefer the controlled roles below. Use other only when none fit, and explain the custom function in reason.",
                 "Role definitions:",
                 "- definition: introduces the meaning, identity, scope, or notation of a term, symbol, object, variable, or concept.",
@@ -1927,19 +2365,153 @@ class PropositionQueryTimeEvidenceAssembler(QueryTimeEvidenceAssembler):
                 "- contrast_exception: states a distinction, exception, limitation, or contrast.",
                 "Do not tag every proposition as definition. Only use definition when the proposition actually introduces or explains a target.",
                 "Roles are hypotheses, not summaries. Keep targets and values short and copied from or tightly grounded in the source text.",
-                "Nearby support assets are listed as [SUPPORT element_id]. If a support asset clearly illustrates or proves a proposition, append the exact support reference to that proposition.",
+                "Nearby support assets are listed as [SUPPORT element_id]. If a support asset clearly illustrates or proves an accepted proposition, append the exact support reference to that proposition.",
                 "Do not invent facts that are not supported by the content.",
-                "Use an empty propositions array only when the content has no meaningful proposition.",
                 "",
                 "Return one entry for every Element ID.",
+                "Each entry must contain element_id, accepted, needs_repair, and omitted.",
+                "Use an empty array when a bucket has no items.",
                 "",
                 "Nearby Support Context:",
                 support_context or "None.",
+                "",
+                "Document Naming Context:",
+                naming_context or "None.",
                 "",
                 "Elements:",
                 "\n".join(lines).strip(),
             ]
         )
+
+    def _document_naming_context(self, signals: list[ElementSignalRecord], *, limit: int = 64) -> str:
+        if not signals:
+            return ""
+        headings: list[str] = []
+        symbol_counts: Counter[str] = Counter()
+        phrase_counts: Counter[str] = Counter()
+        phrase_first_index: dict[str, int] = {}
+        term_counts: Counter[str] = Counter()
+        heading_tokens: set[str] = set()
+
+        for signal in signals:
+            text = re.sub(r"\s+", " ", signal.text).strip()
+            if signal.is_heading and text:
+                headings.append(text)
+                heading_tokens.update(_completion_tokens(text))
+            for heading in getattr(signal, "heading_path", []) or []:
+                heading_text = re.sub(r"\s+", " ", str(getattr(heading, "text", ""))).strip()
+                if heading_text:
+                    headings.append(heading_text)
+                    heading_tokens.update(_completion_tokens(heading_text))
+            for phrase in _content_chunks(text):
+                normalized_phrase = normalize_term_text(phrase)
+                if not self._naming_context_phrase_is_useful(normalized_phrase):
+                    continue
+                phrase_counts[normalized_phrase] += 1
+                phrase_first_index.setdefault(normalized_phrase, signal.element_index)
+            for symbol in signal.formula_symbols:
+                normalized_symbol = re.sub(r"\s+", "", str(symbol)).strip()
+                if self._naming_context_symbol_is_useful(normalized_symbol):
+                    symbol_counts[normalized_symbol] += 1
+            for term in signal.unique_content_terms:
+                normalized = normalize_term_text(term)
+                if self._naming_context_term_is_useful(normalized):
+                    term_counts[normalized] += 1
+
+        lines: list[str] = [
+            "Use this only to resolve local references and choose document-native names.",
+            "Do not copy facts from this context unless the current Content supports them.",
+        ]
+        unique_headings = [
+            heading
+            for heading in dict.fromkeys(headings)
+            if self._naming_context_term_is_useful(normalize_term_text(heading))
+        ][:12]
+        if unique_headings:
+            lines.append("Titles/Headings:")
+            lines.extend(f"- {heading}" for heading in unique_headings)
+
+        scored_phrases = sorted(
+            phrase_counts.items(),
+            key=lambda item: (
+                item[1] * 4
+                + len(set(_completion_tokens(item[0])) & heading_tokens) * 3
+                + min(4, len(_completion_tokens(item[0]))),
+                -phrase_first_index.get(item[0], 999999),
+                item[0],
+            ),
+            reverse=True,
+        )
+        phrases = [phrase for phrase, _count in scored_phrases[:limit]]
+        if phrases:
+            lines.append("Document-native phrases:")
+            lines.extend(f"- {phrase}" for phrase in phrases)
+
+        scored_terms = sorted(
+            term_counts.items(),
+            key=lambda item: (item[1], len(item[0]), item[0]),
+            reverse=True,
+        )
+        terms = [term for term, count in scored_terms if count >= 2][:limit]
+        if terms:
+            lines.append("Document-native terms:")
+            lines.extend(f"- {term}" for term in terms)
+
+        symbols = [
+            symbol
+            for symbol, _count in sorted(
+                symbol_counts.items(),
+                key=lambda item: (item[1], len(item[0]), item[0]),
+                reverse=True,
+            )
+        ][:40]
+        if symbols:
+            lines.append("Symbols/notation:")
+            lines.extend(f"- {symbol}" for symbol in symbols)
+        return "\n".join(lines)
+
+    def _naming_context_term_is_useful(self, term: str) -> bool:
+        if not term:
+            return False
+        if term in STOPWORDS or term in COMPLETION_NOISE_TERMS:
+            return False
+        if len(term) < 2:
+            return False
+        return bool(re.search(r"[a-zA-Z0-9]", term))
+
+    def _naming_context_phrase_is_useful(self, phrase: str) -> bool:
+        if not phrase:
+            return False
+        tokens = _completion_tokens(phrase)
+        if len(tokens) < 2 or len(tokens) > 6:
+            return False
+        if any(token in COMPLETION_NOISE_TERMS for token in tokens):
+            return False
+        useful_tokens = [token for token in tokens if self._naming_context_term_is_useful(token)]
+        if len(useful_tokens) < 2:
+            return False
+        return True
+
+    def _naming_context_symbol_is_useful(self, symbol: str) -> bool:
+        normalized = symbol.strip()
+        if not normalized:
+            return False
+        lowered = normalized.lower()
+        if lowered in STOPWORDS or lowered in COMPLETION_NOISE_TERMS:
+            return False
+        if re.search(r"[()_=^*/]|[0-9]", normalized):
+            return True
+        if any(char.isupper() for char in normalized):
+            return True
+        return len(normalized) <= 2
+
+    def _proposition_heading_context(self, signal: ElementSignalRecord) -> str:
+        headings = [
+            re.sub(r"\s+", " ", str(getattr(heading, "text", ""))).strip()
+            for heading in getattr(signal, "heading_path", []) or []
+        ]
+        headings = [heading for heading in headings if heading]
+        return " > ".join(dict.fromkeys(headings))
 
     def _support_context_for_batch(
         self,
@@ -1972,6 +2544,104 @@ class PropositionQueryTimeEvidenceAssembler(QueryTimeEvidenceAssembler):
         return "\n".join(lines)
 
     def _proposition_response_format(self) -> Mapping[str, Any]:
+        role_schema = {
+            "type": "object",
+            "properties": {
+                "role": {
+                    "type": "string",
+                    "enum": [
+                        "definition",
+                        "claim",
+                        "assumption",
+                        "condition",
+                        "procedure_step",
+                        "proof_setup",
+                        "proof_reason",
+                        "proof_conclusion",
+                        "contradiction",
+                        "quantity_bound",
+                        "example",
+                        "visual_support",
+                        "table_support",
+                        "formula_support",
+                        "contrast_exception",
+                        "other",
+                    ],
+                },
+                "target": {"type": "string"},
+                "value": {"type": "string"},
+                "confidence": {"type": "number"},
+                "reason": {"type": "string"},
+            },
+            "required": ["role", "target", "value", "confidence", "reason"],
+            "additionalProperties": False,
+        }
+        need_hint_schema = {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": [
+                        "definition_support",
+                        "bound_support",
+                        "complexity_support",
+                        "condition_support",
+                        "procedure_support",
+                        "proof_support",
+                        "source_support",
+                    ],
+                },
+                "question": {"type": "string"},
+                "target": {"type": "string"},
+                "expected_support": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "anchor_terms": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "confidence": {"type": "number"},
+                "reason": {"type": "string"},
+            },
+            "required": ["kind", "question", "target", "expected_support", "anchor_terms", "confidence", "reason"],
+            "additionalProperties": False,
+        }
+        accepted_schema = {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "roles": {
+                    "type": "array",
+                    "items": role_schema,
+                },
+                "possible_needs": {
+                    "type": "array",
+                    "items": need_hint_schema,
+                },
+            },
+            "required": ["text", "roles", "possible_needs"],
+            "additionalProperties": False,
+        }
+        repair_schema = {
+            "type": "object",
+            "properties": {
+                "source_fragment": {"type": "string"},
+                "missing_context": {"type": "string"},
+                "repair_hint": {"type": "string"},
+            },
+            "required": ["source_fragment", "missing_context", "repair_hint"],
+            "additionalProperties": False,
+        }
+        omitted_schema = {
+            "type": "object",
+            "properties": {
+                "source_fragment": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["source_fragment", "reason"],
+            "additionalProperties": False,
+        }
         return {
             "type": "json_schema",
             "json_schema": {
@@ -1986,54 +2656,14 @@ class PropositionQueryTimeEvidenceAssembler(QueryTimeEvidenceAssembler):
                                 "type": "object",
                                 "properties": {
                                     "element_id": {"type": "string"},
-                                    "propositions": {
+                                    "accepted": {
                                         "type": "array",
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "text": {"type": "string"},
-                                                "roles": {
-                                                    "type": "array",
-                                                    "items": {
-                                                        "type": "object",
-                                                        "properties": {
-                                                            "role": {
-                                                                "type": "string",
-                                                                "enum": [
-                                                                    "definition",
-                                                                    "claim",
-                                                                    "assumption",
-                                                                    "condition",
-                                                                    "procedure_step",
-                                                                    "proof_setup",
-                                                                    "proof_reason",
-                                                                    "proof_conclusion",
-                                                                    "contradiction",
-                                                                    "quantity_bound",
-                                                                    "example",
-                                                                    "visual_support",
-                                                                    "table_support",
-                                                                    "formula_support",
-                                                                    "contrast_exception",
-                                                                    "other",
-                                                                ],
-                                                            },
-                                                            "target": {"type": "string"},
-                                                            "value": {"type": "string"},
-                                                            "confidence": {"type": "number"},
-                                                            "reason": {"type": "string"},
-                                                        },
-                                                        "required": ["role", "target", "value", "confidence", "reason"],
-                                                        "additionalProperties": False,
-                                                    },
-                                                },
-                                            },
-                                            "required": ["text", "roles"],
-                                            "additionalProperties": False,
-                                        },
+                                        "items": accepted_schema,
                                     },
+                                    "needs_repair": {"type": "array", "items": repair_schema},
+                                    "omitted": {"type": "array", "items": omitted_schema},
                                 },
-                                "required": ["element_id", "propositions"],
+                                "required": ["element_id", "accepted", "needs_repair", "omitted"],
                                 "additionalProperties": False,
                             },
                         },
@@ -2070,25 +2700,59 @@ class PropositionQueryTimeEvidenceAssembler(QueryTimeEvidenceAssembler):
             element_id = str(item.get("element_id") or "").strip()
             if not element_id:
                 continue
-            propositions = item.get("propositions", [])
+            propositions = item.get("accepted", item.get("propositions", []))
             parsed[element_id] = self._clean_propositions(propositions if isinstance(propositions, list) else [])
+            self._record_proposition_response_diagnostics(element_id=element_id, item=item)
         return parsed
+
+    def _record_proposition_response_diagnostics(self, *, element_id: str, item: Mapping[str, Any]) -> None:
+        for raw in item.get("needs_repair", []) if isinstance(item.get("needs_repair"), list) else []:
+            if not isinstance(raw, Mapping):
+                continue
+            source_fragment = re.sub(r"\s+", " ", str(raw.get("source_fragment", ""))).strip()
+            missing_context = re.sub(r"\s+", " ", str(raw.get("missing_context", ""))).strip()
+            repair_hint = re.sub(r"\s+", " ", str(raw.get("repair_hint", ""))).strip()
+            if source_fragment or missing_context or repair_hint:
+                self.proposition_repair_items.append(
+                    {
+                        "element_id": element_id,
+                        "source_fragment": source_fragment,
+                        "missing_context": missing_context,
+                        "repair_hint": repair_hint,
+                    }
+                )
+        for raw in item.get("omitted", []) if isinstance(item.get("omitted"), list) else []:
+            if not isinstance(raw, Mapping):
+                continue
+            source_fragment = re.sub(r"\s+", " ", str(raw.get("source_fragment", ""))).strip()
+            reason = re.sub(r"\s+", " ", str(raw.get("reason", ""))).strip()
+            if source_fragment or reason:
+                self.proposition_omitted_items.append(
+                    {
+                        "element_id": element_id,
+                        "source_fragment": source_fragment,
+                        "reason": reason,
+                    }
+                )
 
     def _clean_propositions(self, propositions: Iterable[Any]) -> list[_PropositionDraft]:
         cleaned: list[_PropositionDraft] = []
         for proposition in propositions:
             roles: list[PropositionRoleHypothesis] = []
+            possible_needs: list[PropositionNeedHint] = []
             if isinstance(proposition, _PropositionDraft):
                 text_value = proposition.text
                 roles = list(proposition.roles)
+                possible_needs = list(proposition.possible_needs)
             elif isinstance(proposition, Mapping):
                 text_value = proposition.get("text", "")
                 roles = self._clean_role_hypotheses(proposition.get("roles", []))
+                possible_needs = self._clean_possible_need_hints(proposition.get("possible_needs", []))
             else:
                 text_value = proposition
             text = re.sub(r"\s+", " ", str(text_value)).strip()
             if text:
-                cleaned.append(_PropositionDraft(text=text, roles=roles))
+                cleaned.append(_PropositionDraft(text=text, roles=roles, possible_needs=possible_needs))
         return cleaned
 
     def _clean_role_hypotheses(self, roles: Any) -> list[PropositionRoleHypothesis]:
@@ -2118,6 +2782,59 @@ class PropositionQueryTimeEvidenceAssembler(QueryTimeEvidenceAssembler):
                 )
             )
             if len(cleaned) >= 5:
+                break
+        return cleaned
+
+    def _clean_possible_need_hints(self, possible_needs: Any) -> list[PropositionNeedHint]:
+        if not isinstance(possible_needs, list):
+            return []
+        cleaned: list[PropositionNeedHint] = []
+        allowed_kinds = {
+            "definition_support",
+            "bound_support",
+            "complexity_support",
+            "condition_support",
+            "procedure_support",
+            "proof_support",
+            "source_support",
+        }
+        for item in possible_needs:
+            if not isinstance(item, Mapping):
+                continue
+            kind = re.sub(r"\s+", "_", str(item.get("kind", ""))).strip().lower()
+            if kind not in allowed_kinds:
+                continue
+            question = re.sub(r"\s+", " ", str(item.get("question", ""))).strip()
+            if not question:
+                continue
+            target = re.sub(r"\s+", " ", str(item.get("target", ""))).strip()
+            expected_support = [
+                re.sub(r"\s+", " ", str(value)).strip()[:80]
+                for value in item.get("expected_support", [])
+                if str(value).strip()
+            ][:8]
+            anchor_terms = [
+                re.sub(r"\s+", " ", str(value)).strip()[:80]
+                for value in item.get("anchor_terms", [])
+                if str(value).strip()
+            ][:12]
+            reason = re.sub(r"\s+", " ", str(item.get("reason", ""))).strip()
+            try:
+                confidence = float(item.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            cleaned.append(
+                PropositionNeedHint(
+                    kind=kind,
+                    question=question[:220],
+                    target=target[:160],
+                    expected_support=tuple(expected_support),
+                    anchor_terms=tuple(anchor_terms),
+                    confidence=max(0.0, min(1.0, confidence)),
+                    reason=reason[:220],
+                )
+            )
+            if len(cleaned) >= 4:
                 break
         return cleaned
 
@@ -2418,6 +3135,13 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
         dependency_resolver_depth: int = 2,
         dependency_resolver_max_frames: int = 32,
         dependency_support_verifier: SupportVerifier | None = None,
+        use_query_need_resolver: bool = False,
+        query_need_max_depth: int = 1,
+        query_need_max_active: int = 4,
+        query_need_max_supports_per_need: int = 1,
+        query_need_min_support_score: float = 0.34,
+        query_need_max_selected_supports: int = 8,
+        syntax_frame_producer: object | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -2456,6 +3180,13 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
         self.dependency_resolver_depth = max(0, int(dependency_resolver_depth))
         self.dependency_resolver_max_frames = max(1, int(dependency_resolver_max_frames))
         self.dependency_support_verifier = dependency_support_verifier
+        self.use_query_need_resolver = bool(use_query_need_resolver)
+        self.query_need_max_depth = max(0, int(query_need_max_depth))
+        self.query_need_max_active = max(1, int(query_need_max_active))
+        self.query_need_max_supports_per_need = max(1, int(query_need_max_supports_per_need))
+        self.query_need_min_support_score = max(0.0, float(query_need_min_support_score))
+        self.query_need_max_selected_supports = max(1, int(query_need_max_selected_supports))
+        self.syntax_frame_producer = syntax_frame_producer
         self._query_plan_cache: dict[str, QueryRetrievalPlan] = {}
         self._source_traversal_vocabulary_cache: dict[str, _SourceTraversalVocabularyCache] = {}
         self._document_assembly_cache: dict[str, _DocumentAssemblyCache] = {}
@@ -2501,6 +3232,14 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
             dependency_packages, core_candidates = self._dependency_resolver_core_candidates(
                 signals=signals,
                 propositions=propositions,
+                core_candidates=core_candidates,
+            )
+        query_need_packages: list[QueryNeedPackage] = []
+        if self.use_query_need_resolver:
+            query_need_packages, core_candidates = self._query_need_core_candidates(
+                prompt=prompt,
+                propositions=propositions,
+                proposition_embeddings=proposition_embeddings,
                 core_candidates=core_candidates,
             )
         graph = document_cache.graph
@@ -2575,6 +3314,7 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
             propositions=propositions,
             retrieval_plan=retrieval_plan,
             dependency_packages=dependency_packages,
+            query_need_packages=query_need_packages,
             answer_bundle=answer_bundle,
             source_traversals=source_traversals,
             source_traversal_packages=source_traversal_packages,
@@ -2635,6 +3375,77 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
             updated_candidates.append(replace(core_candidate, anchor_prop_indices=anchor_indices))
         return dependency_packages, updated_candidates
 
+    def _query_need_core_candidates(
+        self,
+        *,
+        prompt: str,
+        propositions: list[QueryEvidenceProposition],
+        proposition_embeddings: np.ndarray,
+        core_candidates: list[_CoreCandidate],
+    ) -> tuple[list[QueryNeedPackage], list[_CoreCandidate]]:
+        context = build_query_context(prompt)
+        resolver = QueryNeedResolver(
+            max_active_needs=self.query_need_max_active,
+            max_depth=self.query_need_max_depth,
+            max_supports_per_need=self.query_need_max_supports_per_need,
+            min_support_score=self.query_need_min_support_score,
+            max_selected_supports=self.query_need_max_selected_supports,
+        )
+        proposition_index_by_id = {
+            proposition.proposition_id: index
+            for index, proposition in enumerate(propositions)
+        }
+        semantic_cache: dict[tuple[str, tuple[str, ...]], dict[int, float]] = {}
+
+        def semantic_scores_for_need(need: object) -> Mapping[int, float]:
+            search_questions = tuple(str(item) for item in getattr(need, "search_questions", ()) if str(item).strip())
+            if not search_questions:
+                return {}
+            cache_key = (str(getattr(need, "need_id", "")), search_questions)
+            cached = semantic_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            search_embeddings = self._embed(list(search_questions))
+            if len(search_embeddings) == 0:
+                scores: dict[int, float] = {}
+            else:
+                matrix = proposition_embeddings @ search_embeddings.T
+                scores = {
+                    index: float(np.max(row))
+                    for index, row in enumerate(matrix)
+                }
+            semantic_cache[cache_key] = scores
+            return scores
+
+        query_need_packages: list[QueryNeedPackage] = []
+        updated_candidates: list[_CoreCandidate] = []
+        for core_candidate in core_candidates:
+            if core_candidate.proposition_index is None or core_candidate.proposition_id is None:
+                updated_candidates.append(core_candidate)
+                continue
+            package = resolver.resolve(
+                context=context,
+                core_index=core_candidate.proposition_index,
+                propositions=propositions,
+                semantic_score_fn=semantic_scores_for_need,
+            )
+            query_need_packages.append(package)
+            support_anchor_indices = [
+                proposition_index_by_id[proposition_id]
+                for proposition_id in package.selected_proposition_ids
+                if proposition_id in proposition_index_by_id
+            ]
+            anchor_indices = tuple(
+                dict.fromkeys(
+                    [
+                        *core_candidate.anchor_prop_indices,
+                        *support_anchor_indices,
+                    ]
+                )
+            )
+            updated_candidates.append(replace(core_candidate, anchor_prop_indices=anchor_indices))
+        return query_need_packages, updated_candidates
+
     def _dependency_resolver_candidates(
         self,
         *,
@@ -2645,6 +3456,12 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
         frame_candidates: list[FrameCandidate] = []
         signal_by_element_id = {signal.element_id: signal for signal in signals}
         term_seeds_by_proposition: dict[str, list[_DependencyTermSeed]] = {}
+        syntax_result = self._syntax_dependency_resolver_candidates(
+            signals=signals,
+            propositions=propositions,
+        )
+        term_candidates.extend(syntax_result[0])
+        frame_candidates.extend(syntax_result[1])
 
         for proposition in propositions:
             for role_index, role in enumerate(proposition.roles):
@@ -2734,6 +3551,27 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
                     document_frequencies=document_frequencies,
                 )
             )
+        return term_candidates, frame_candidates
+
+    def _syntax_dependency_resolver_candidates(
+        self,
+        *,
+        signals: list[ElementSignalRecord],
+        propositions: list[QueryEvidenceProposition],
+    ) -> tuple[list[TermCandidate], list[FrameCandidate]]:
+        producer = self.syntax_frame_producer
+        if producer is None or not hasattr(producer, "produce"):
+            return [], []
+        result = producer.produce(signals=signals, propositions=propositions)
+        term_candidates = list(getattr(result, "term_candidates", ()) or ())
+        frame_candidates = list(getattr(result, "frame_candidates", ()) or ())
+        if not frame_candidates:
+            for attr_name in (
+                "proof_frame_candidates",
+                "evidence_frame_candidates",
+                "route_frame_candidates",
+            ):
+                frame_candidates.extend(getattr(result, attr_name, ()) or ())
         return term_candidates, frame_candidates
 
     def _dependency_term_seeds(
@@ -5479,16 +6317,19 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
 
         accepted_prop_indices: list[int] = []
         score_by_element_index: dict[int, float] = {}
+        forced_anchor_element_indices: set[int] = set()
         for anchor_prop_index in (core_candidate.anchor_prop_indices or (core_prop_index,)):
             if anchor_prop_index is None or anchor_prop_index < 0 or anchor_prop_index >= len(propositions):
                 continue
             anchor_signal = signals[propositions[anchor_prop_index].element_index]
+            forced_anchor_element_indices.add(anchor_signal.element_index)
             if anchor_signal.element_index in score_by_element_index:
                 continue
             accepted_prop_indices.append(anchor_prop_index)
             score_by_element_index[anchor_signal.element_index] = 1.0 if anchor_prop_index == core_prop_index else 0.94
         if core_prop_index not in accepted_prop_indices:
             accepted_prop_indices.insert(0, core_prop_index)
+            forced_anchor_element_indices.add(core_index)
             score_by_element_index[core_index] = 1.0
         for candidate_score, prop_index in sorted(candidate_scores, reverse=True):
             proposition = propositions[prop_index]
@@ -5525,6 +6366,7 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
             proposition_embeddings=proposition_embeddings,
             proposition_similarities=proposition_similarities,
             core_prop_index=core_prop_index,
+            forced_anchor_element_indices=forced_anchor_element_indices,
         )
         decisions.extend(span_decisions)
         for signal in selected:
@@ -5614,6 +6456,7 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
         proposition_embeddings: np.ndarray,
         proposition_similarities: np.ndarray,
         core_prop_index: int,
+        forced_anchor_element_indices: set[int] | None = None,
     ) -> tuple[list[ElementSignalRecord], list[QueryAssemblyDecision]]:
         prompt_tokens = _content_tokens(prompt)
         core_element_index = propositions[core_prop_index].element_index
@@ -5735,6 +6578,41 @@ class ConsensusKnnPropositionEvidenceAssembler(PropositionQueryTimeEvidenceAssem
         for span in kept_spans:
             for index in span.element_indices:
                 selected_by_index[index] = signals[index]
+        token_count = sum(signal.token_count for signal in selected_by_index.values())
+        for index in sorted(forced_anchor_element_indices or set()):
+            if index in selected_by_index:
+                continue
+            if index < 0 or index >= len(signals):
+                continue
+            signal = signals[index]
+            if token_count + signal.token_count > self.max_package_tokens:
+                decisions.append(
+                    self._decision(
+                        signal,
+                        direction="cluster",
+                        action="skipped",
+                        query_similarity=0.0,
+                        core_similarity=0.0,
+                        previous_query_similarity=0.0,
+                        previous_core_similarity=0.0,
+                        reason="forced anchor exceeded token budget",
+                    )
+                )
+                continue
+            selected_by_index[index] = signal
+            token_count += signal.token_count
+            decisions.append(
+                self._decision(
+                    signal,
+                    direction="cluster",
+                    action="attached",
+                    query_similarity=0.0,
+                    core_similarity=0.0,
+                    previous_query_similarity=0.0,
+                    previous_core_similarity=0.0,
+                    reason="forced dependency/need anchor attached outside ordered span",
+                )
+            )
         selected = [selected_by_index[index] for index in sorted(selected_by_index)]
         for index in anchor_indices:
             if index in selected_by_index and index != core_element_index:

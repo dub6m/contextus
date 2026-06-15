@@ -4,12 +4,15 @@ import numpy as np
 
 from contextus.builder.query_assembly import (
     ConsensusKnnPropositionEvidenceAssembler,
+    PropositionRoleHypothesis,
     PropositionQueryTimeEvidenceAssembler,
     QueryAssemblyResult,
     QueryEvidenceProposition,
     QueryTimeEvidenceAssembler,
 )
-from contextus.builder.dependency_resolver import FactFrame, ResolvedPackage, SourceRef
+from contextus.builder.dependency_resolver import FactFrame, FrameCandidate, ResolvedPackage, SlotCandidate, SourceRef, TermCandidate
+from contextus.builder.query_needs import QueryNeedResolver, build_query_context
+from contextus.builder.syntax_frames import SyntaxFrameExtractionResult
 from contextus.ingestion.models import ExtractedDocument, ExtractedElement, ExtractedPage
 from contextus.llm import LLMResponse
 
@@ -67,6 +70,27 @@ def bridge_embed(texts: list[str]) -> np.ndarray:
                 lowered.count("zeta"),
                 lowered.count("boxes"),
                 lowered.count("rows"),
+            ]
+        )
+    return np.asarray(vectors, dtype=float)
+
+
+def need_embed(texts: list[str]) -> np.ndarray:
+    vectors = []
+    for text in texts:
+        lowered = text.lower()
+        vectors.append(
+            [
+                lowered.count("merge"),
+                lowered.count("linear"),
+                lowered.count("15"),
+                lowered.count("sy"),
+                lowered.count("positions"),
+                lowered.count("sorted"),
+                lowered.count("omega"),
+                lowered.count("constant"),
+                lowered.count("bound"),
+                lowered.count("next"),
             ]
         )
     return np.asarray(vectors, dtype=float)
@@ -247,8 +271,10 @@ class PropositionLLM:
     def __init__(self, payload: str):
         self.payload = payload
         self.request_count = 0
+        self.requests = []
 
     def complete_many(self, requests):
+        self.requests.extend(requests)
         self.request_count += len(requests)
         return [LLMResponse(self.payload) for _ in requests]
 
@@ -257,10 +283,12 @@ class SequenceLLM:
     def __init__(self, payloads: list[str]):
         self.payloads = payloads
         self.request_count = 0
+        self.requests = []
 
     def complete_many(self, requests):
         responses = []
         for _request in requests:
+            self.requests.append(_request)
             self.request_count += 1
             responses.append(LLMResponse(self.payloads.pop(0)))
         return responses
@@ -269,7 +297,7 @@ class SequenceLLM:
 def test_proposition_query_assembler_selects_answer_bearing_proposition_core():
     elements = [
         make_element("heading", "Alpha Overview", order=1),
-        make_element("body", "Tiny label", order=2),
+        make_element("body", "Gamma explains alpha answer in detail.", order=2),
     ]
     llm = PropositionLLM(
         '{"elements":['
@@ -355,6 +383,418 @@ def test_proposition_query_assembler_does_not_send_support_elements_for_generati
 
     assert llm.request_count == 1
     assert {proposition.element_id for proposition in result.propositions} == {"body", "fig"}
+
+
+def test_proposition_query_assembler_rejects_ungrounded_generated_proposition_for_element():
+    elements = [
+        make_element("heading", "Closest Pair", order=1, element_type="title"),
+        make_element("body", "Alpha body fact.", order=2),
+    ]
+    llm = PropositionLLM(
+        '{"elements":['
+        '{"element_id":"heading","propositions":["Closest Pair","Alpha body fact belongs elsewhere."]},'
+        '{"element_id":"body","propositions":["Alpha body fact."]}'
+        ']}'
+    )
+
+    result = PropositionQueryTimeEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+    ).assemble(make_document(elements), "alpha")
+
+    heading_props = [proposition.text for proposition in result.propositions if proposition.element_id == "heading"]
+    assert heading_props == ["Closest Pair"]
+    assert [proposition.text for proposition in result.propositions if proposition.element_id == "body"] == [
+        "Alpha body fact."
+    ]
+
+
+def test_proposition_query_assembler_drops_meta_proposition_when_content_claim_exists():
+    elements = [
+        make_element("body", "Alpha computes beta.", order=1),
+    ]
+    llm = PropositionLLM(
+        '{"elements":[{'
+        '"element_id":"body",'
+        '"propositions":["The document discusses Alpha.","Alpha computes beta."]'
+        '}]}'
+    )
+
+    result = PropositionQueryTimeEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+    ).assemble(make_document(elements), "alpha beta")
+
+    assert [proposition.text for proposition in result.propositions] == ["Alpha computes beta."]
+
+
+def test_proposition_query_assembler_falls_back_when_all_generated_propositions_are_meta():
+    elements = [
+        make_element("body", "Alpha computes beta.", order=1),
+    ]
+    llm = PropositionLLM(
+        '{"elements":[{'
+        '"element_id":"body",'
+        '"propositions":["The document discusses Alpha."]'
+        '}]}'
+    )
+
+    result = PropositionQueryTimeEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+    ).assemble(make_document(elements), "alpha beta")
+
+    assert [proposition.text for proposition in result.propositions] == ["Alpha computes beta."]
+
+
+def test_proposition_query_assembler_falls_back_from_generated_title_meta_statement():
+    elements = [
+        make_element("heading", "Closest Pair", order=1, element_type="title"),
+    ]
+    llm = PropositionLLM(
+        '{"elements":[{'
+        '"element_id":"heading",'
+        '"propositions":["The document title is Closest Pair."]'
+        '}]}'
+    )
+
+    result = PropositionQueryTimeEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+    ).assemble(make_document(elements), "closest pair")
+
+    assert [proposition.text for proposition in result.propositions] == ["Closest Pair"]
+
+
+def test_proposition_query_assembler_falls_back_from_generated_document_makes_meta_statement():
+    elements = [
+        make_element("body", "Let's make some reasonable assumptions regarding several basic operations:", order=1),
+    ]
+    llm = PropositionLLM(
+        '{"elements":[{'
+        '"element_id":"body",'
+        '"propositions":["The document makes assumptions regarding several basic operations."]'
+        '}]}'
+    )
+
+    result = PropositionQueryTimeEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+    ).assemble(make_document(elements), "basic operations")
+
+    assert [proposition.text for proposition in result.propositions] == [
+        "Let's make some reasonable assumptions regarding several basic operations:"
+    ]
+
+
+def test_proposition_query_assembler_falls_back_from_generated_text_wrapper_meta_statement():
+    elements = [
+        make_element("body", "Let's make some reasonable assumptions regarding several basic operations:", order=1),
+    ]
+    llm = PropositionLLM(
+        '{"elements":[{'
+        '"element_id":"body",'
+        '"propositions":["The text will state several reasonable assumptions regarding basic operations."]'
+        '}]}'
+    )
+
+    result = PropositionQueryTimeEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+    ).assemble(make_document(elements), "basic operations")
+
+    assert [proposition.text for proposition in result.propositions] == [
+        "Let's make some reasonable assumptions regarding several basic operations:"
+    ]
+
+
+def test_proposition_query_assembler_falls_back_from_generated_element_type_meta_statement():
+    elements = [
+        make_element("formula", "Formula: Let n = |P'| = |P'_x| = |P'_y|", order=1, element_type="formula"),
+    ]
+    llm = PropositionLLM(
+        '{"elements":[{'
+        '"element_id":"formula",'
+        '"propositions":["Element of type formula on page 3."]'
+        '}]}'
+    )
+
+    result = PropositionQueryTimeEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+    ).assemble(make_document(elements), "formula n")
+
+    assert [proposition.text for proposition in result.propositions] == [
+        "Formula: Let n = |P'| = |P'_x| = |P'_y|"
+    ]
+
+
+def test_proposition_generation_batches_share_document_naming_context_in_parallel():
+    elements = [
+        make_element("heading", "Closest Pair", order=1, element_type="title"),
+        make_element(
+            "intro",
+            "The closest-pair problem asks for a pair of points with smallest possible distance.",
+            order=2,
+        ),
+        make_element(
+            "goal",
+            "Our goal here is to present an algorithm which solves the problem in time O(n log n).",
+            order=3,
+        ),
+    ]
+    llm = SequenceLLM(
+        [
+            '{"elements":[{"element_id":"heading","accepted":[{"text":"Closest Pair","roles":[]}],"needs_repair":[],"omitted":[]}]}',
+            '{"elements":[{"element_id":"intro","accepted":[{"text":"The closest-pair problem asks for a pair of points with smallest possible distance.","roles":[]}],"needs_repair":[],"omitted":[]}]}',
+            '{"elements":[{"element_id":"goal","accepted":[{"text":"An O(n log n) algorithm is the target solution for the closest-pair problem.","roles":[]}],"needs_repair":[],"omitted":[]}]}',
+        ]
+    )
+
+    result = PropositionQueryTimeEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        proposition_batch_size=1,
+        top_k_cores=1,
+        max_side_elements=0,
+    ).assemble(make_document(elements), "closest pair algorithm")
+
+    assert llm.request_count == 3
+    assert len(llm.requests) == 3
+    for request in llm.requests:
+        assert "Document Naming Context:" in request.user
+        assert "Use this only to resolve local references and choose document-native names." in request.user
+        assert "Do not copy facts from this context unless the current Content supports them." in request.user
+        assert "Titles/Headings:" in request.user
+        assert "- Closest Pair" in request.user
+        assert "Document-native phrases:" in request.user
+        assert "- closest pair problem" in request.user
+        assert "Previous Accepted Propositions:" not in request.user
+    assert [proposition.text for proposition in result.propositions] == [
+        "Closest Pair",
+        "The closest-pair problem asks for a pair of points with smallest possible distance.",
+        "An O(n log n) algorithm is the target solution for the closest-pair problem.",
+    ]
+
+
+def test_proposition_generation_prompt_includes_heading_context():
+    elements = [
+        make_element("heading", "Closest Pair", order=1, element_type="title"),
+        make_element("body", "This problem has input P.", order=2),
+    ]
+    assembler = PropositionQueryTimeEvidenceAssembler(embed_texts=keyword_embed)
+    signals = assembler._signal_builder.build(make_document(elements)).signals
+
+    prompt = assembler._proposition_generation_prompt([signals[1]], all_signals=signals)
+
+    assert "Heading Path: Closest Pair" in prompt
+    assert "Do not place a proposition under an Element ID unless" in prompt
+    assert "Bad: The section explains how the process works." in prompt
+    assert "Good: Photosynthesis converts light energy into chemical energy." in prompt
+    assert "A perfect proposition is a standalone document fact" in prompt
+    assert "For title-only content, return the title itself" in prompt
+    assert "First identify the source-backed item" in prompt
+    assert "do not invent a placeholder subject" in prompt
+    assert "put it in needs_repair" in prompt
+    assert "Each entry must contain element_id, accepted, needs_repair, and omitted." in prompt
+    assert "Document Naming Context:" in prompt
+    assert "Preserve symbols" in prompt
+    assert "Procedure steps may remain imperative" in prompt
+
+
+def test_proposition_response_accepts_repair_buckets_and_records_diagnostics():
+    assembler = PropositionQueryTimeEvidenceAssembler(embed_texts=keyword_embed)
+
+    parsed = assembler._parse_proposition_response(
+        '{"elements":[{'
+        '"element_id":"body",'
+        '"accepted":[{"text":"Alpha computes beta.","roles":[]}],'
+        '"needs_repair":[{'
+        '"source_fragment":"these assumptions",'
+        '"missing_context":"The assumptions are not named in this element.",'
+        '"repair_hint":"Use prior accepted propositions that name the assumptions."'
+        '}],'
+        '"omitted":[{"source_fragment":"decorative divider","reason":"No useful proposition."}]'
+        '}]}'
+    )
+
+    assert parsed is not None
+    assert [draft.text for draft in parsed["body"]] == ["Alpha computes beta."]
+    assert assembler.proposition_repair_items == [
+        {
+            "element_id": "body",
+            "source_fragment": "these assumptions",
+            "missing_context": "The assumptions are not named in this element.",
+            "repair_hint": "Use prior accepted propositions that name the assumptions.",
+        }
+    ]
+    assert assembler.proposition_omitted_items == [
+        {
+            "element_id": "body",
+            "source_fragment": "decorative divider",
+            "reason": "No useful proposition.",
+        }
+    ]
+
+
+def test_proposition_generation_keeps_empty_accepted_repair_item_out_of_fallback():
+    elements = [
+        make_element("body", "These assumptions will be used later.", order=1),
+    ]
+    signals = PropositionQueryTimeEvidenceAssembler(embed_texts=keyword_embed)._signal_builder.build(
+        make_document(elements)
+    ).signals
+    llm = SequenceLLM(
+        [
+            '{"elements":[{'
+            '"element_id":"body",'
+            '"accepted":[],'
+            '"needs_repair":[{'
+            '"source_fragment":"These assumptions will be used later.",'
+            '"missing_context":"The assumptions are not named in this element.",'
+            '"repair_hint":"Use surrounding accepted propositions that identify the assumptions."'
+            '}],'
+            '"omitted":[]'
+            '}]}',
+            '{"elements":[{"element_id":"body","accepted":[],"needs_repair":[],"omitted":[]}]}',
+        ]
+    )
+    assembler = PropositionQueryTimeEvidenceAssembler(llm_client=llm, embed_texts=keyword_embed)
+    by_element = {}
+
+    assembler._generate_missing_propositions(signals, by_element, all_signals=signals)
+
+    assert by_element["body"] == []
+    assert assembler.proposition_repair_items == [
+        {
+            "element_id": "body",
+            "source_fragment": "These assumptions will be used later.",
+            "missing_context": "The assumptions are not named in this element.",
+            "repair_hint": "Use surrounding accepted propositions that identify the assumptions.",
+        }
+    ]
+
+
+def test_proposition_generation_moves_bad_accepted_pointer_to_repair_queue():
+    elements = [
+        make_element("body", "We now show how this can be done.", order=1),
+    ]
+    signals = PropositionQueryTimeEvidenceAssembler(embed_texts=keyword_embed)._signal_builder.build(
+        make_document(elements)
+    ).signals
+    llm = SequenceLLM(
+        [
+            '{"elements":[{'
+            '"element_id":"body",'
+            '"accepted":[{"text":"We now show how this can be done.","roles":[]}],'
+            '"needs_repair":[],'
+            '"omitted":[]'
+            '}]}',
+            '{"elements":[{"element_id":"body","accepted":[],"needs_repair":[],"omitted":[]}]}',
+        ]
+    )
+    assembler = PropositionQueryTimeEvidenceAssembler(llm_client=llm, embed_texts=keyword_embed)
+    by_element = {}
+
+    assembler._generate_missing_propositions(signals, by_element, all_signals=signals)
+
+    assert by_element["body"] == []
+    assert assembler.proposition_repair_items == [
+        {
+            "element_id": "body",
+            "source_fragment": "We now show how this can be done.",
+            "missing_context": "The proposition is still framed through the narrator rather than the document-native fact.",
+            "repair_hint": "Repair with surrounding accepted propositions and source context before accepting.",
+        }
+    ]
+
+
+def test_proposition_generation_moves_unnamed_group_reference_to_repair_queue():
+    elements = [
+        make_element("body", "These two assumptions will be used later.", order=1),
+    ]
+    signals = PropositionQueryTimeEvidenceAssembler(embed_texts=keyword_embed)._signal_builder.build(
+        make_document(elements)
+    ).signals
+    llm = SequenceLLM(
+        [
+            '{"elements":[{'
+            '"element_id":"body",'
+            '"accepted":[{"text":"The two assumptions will be used later.","roles":[]}],'
+            '"needs_repair":[],'
+            '"omitted":[]'
+            '}]}',
+            '{"elements":[{"element_id":"body","accepted":[],"needs_repair":[],"omitted":[]}]}',
+        ]
+    )
+    assembler = PropositionQueryTimeEvidenceAssembler(llm_client=llm, embed_texts=keyword_embed)
+    by_element = {}
+
+    assembler._generate_missing_propositions(signals, by_element, all_signals=signals)
+
+    assert by_element["body"] == []
+    assert assembler.proposition_repair_items[0]["missing_context"] == (
+        "The proposition refers to a grouped set without naming the group members."
+    )
+
+
+def test_proposition_repair_pass_uses_neighboring_accepted_propositions():
+    elements = [
+        make_element("assumption-one", "Distance computations take O(1) time. Arithmetic setup appears here.", order=1),
+        make_element(
+            "assumption-two",
+            "Membership in a set or list can be computed in O(1) time. We will make use of these two assumptions when computing the running time of our algorithm.",
+            order=2,
+        ),
+    ]
+    signals = PropositionQueryTimeEvidenceAssembler(embed_texts=keyword_embed)._signal_builder.build(
+        make_document(elements)
+    ).signals
+    llm = SequenceLLM(
+        [
+            '{"elements":[{"element_id":"assumption-one","accepted":[{"text":"Distance computations take O(1) time.","roles":[]}],"needs_repair":[],"omitted":[]}]}',
+            '{"elements":[{"element_id":"assumption-two","accepted":[{"text":"Membership in a set or list can be computed in O(1) time.","roles":[]}],"needs_repair":[{"source_fragment":"these two assumptions","missing_context":"The two assumptions are not both named in this element.","repair_hint":"Use accepted propositions from the surrounding batch context."}],"omitted":[]}]}',
+            '{"elements":[{"element_id":"assumption-two","accepted":[{"text":"The algorithm running-time analysis uses the distance-computation and membership assumptions.","roles":[]}],"needs_repair":[],"omitted":[]}]}',
+        ]
+    )
+    assembler = PropositionQueryTimeEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=keyword_embed,
+        proposition_batch_size=1,
+    )
+    by_element = {}
+
+    assembler._generate_missing_propositions(signals, by_element, all_signals=signals)
+
+    assert llm.request_count == 3
+    assert "Source Elements From Neighboring Batches:" in llm.requests[2].user
+    assert "Arithmetic setup appears here." in llm.requests[2].user
+    assert "Distance computations take O(1) time." in llm.requests[2].user
+    assert [draft.text for draft in by_element["assumption-two"]] == [
+        "Membership in a set or list can be computed in O(1) time.",
+        "The algorithm running-time analysis uses the distance-computation and membership assumptions.",
+    ]
+    assert assembler.proposition_repaired_items == [
+        {
+            "element_id": "assumption-two",
+            "source_fragment": "these two assumptions",
+            "text": "The algorithm running-time analysis uses the distance-computation and membership assumptions.",
+        }
+    ]
 
 
 def test_consensus_knn_assembler_adds_non_contiguous_cluster_context():
@@ -703,6 +1143,88 @@ def test_consensus_knn_dependency_resolver_uses_document_native_terms_without_ro
     assert result.packages[0].element_ids == ["core", "support"]
 
 
+def test_consensus_knn_dependency_resolver_uses_injected_syntax_frames():
+    class FakeSyntaxFrameProducer:
+        def produce(self, *, signals, propositions):
+            by_element = {proposition.element_id: proposition for proposition in propositions}
+            core = by_element["core"]
+            support = by_element["support"]
+            return SyntaxFrameExtractionResult(
+                term_candidates=(
+                    TermCandidate("core", "Beta concept", 6, 18, "syntax.definition.target"),
+                    TermCandidate("support", "Beta concept", 0, 12, "syntax.definition.target"),
+                    TermCandidate("support", "final answer", 19, 31, "syntax.definition.value"),
+                ),
+                proof_frame_candidates=(
+                    FrameCandidate(
+                        frame_id="frame:core:syntax:definition",
+                        element_id="core",
+                        proposition_id=core.proposition_id,
+                        predicate="definition",
+                        slots={
+                            "target": SlotCandidate(
+                                name="target",
+                                text="Beta concept",
+                                char_start=6,
+                                char_end=18,
+                            )
+                        },
+                        text=core.text,
+                        char_start=0,
+                        char_end=len(core.text),
+                        extraction_status="syntax_frame",
+                    ),
+                    FrameCandidate(
+                        frame_id="frame:support:syntax:definition",
+                        element_id="support",
+                        proposition_id=support.proposition_id,
+                        predicate="definition",
+                        slots={
+                            "target": SlotCandidate(
+                                name="target",
+                                text="Beta concept",
+                                char_start=0,
+                                char_end=12,
+                                grounding_state="grounded",
+                            ),
+                            "value": SlotCandidate(
+                                name="value",
+                                text="final answer",
+                                char_start=19,
+                                char_end=31,
+                                grounding_state="grounded",
+                            ),
+                        },
+                        text=support.text,
+                        char_start=0,
+                        char_end=len(support.text),
+                        extraction_status="syntax_frame",
+                    ),
+                ),
+            )
+
+    elements = [
+        make_element("core", "Alpha Beta concept needs an anchor.", order=1),
+        make_element("support", "Beta concept means final answer.", order=2),
+    ]
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=None,
+        embed_texts=keyword_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.9,
+        use_dependency_resolver=True,
+        syntax_frame_producer=FakeSyntaxFrameProducer(),
+    ).assemble(make_document(elements), "alpha")
+
+    assert result.dependency_packages
+    assert result.dependency_packages[0].selected_elements == ("support",)
+    assert result.packages[0].element_ids == ["core", "support"]
+
+
 def test_consensus_knn_dependency_resolver_rejects_repeated_document_native_label():
     elements = [
         make_element("core", "Mitosis and Meiosis", order=1),
@@ -722,6 +1244,109 @@ def test_consensus_knn_dependency_resolver_rejects_repeated_document_native_labe
 
     assert result.dependency_packages
     assert result.dependency_packages[0].selected_elements == ()
+
+
+def test_query_need_resolver_definition_query_keeps_fallback_needs_query_typed():
+    proposition = QueryEvidenceProposition(
+        proposition_id="p0",
+        element_id="core",
+        element_index=0,
+        text="Return the pair that is the closest among the three pairs.",
+        roles=[
+            PropositionRoleHypothesis(
+                role="procedure_step",
+                target="closest pair",
+                value="return the pair",
+                confidence=0.9,
+                reason="Procedure step.",
+            )
+        ],
+    )
+
+    needs = QueryNeedResolver(max_active_needs=4).possible_needs_for_proposition(
+        context=build_query_context("What is the closest pair problem?"),
+        proposition=proposition,
+        depth=0,
+        parent_need_id="",
+        max_needs=4,
+    )
+
+    assert [need.kind for need in needs] == ["definition_support"]
+
+
+def test_consensus_knn_query_need_resolver_adds_need_specific_support_anchor():
+    elements = [
+        make_element("core", "The merge step is linear because each point in Sy does 15 distance computations.", order=1),
+        make_element("definition", "Sy is the list S sorted by increasing y-coordinate.", order=2),
+        make_element(
+            "support",
+            "If s and t in S satisfy d(s,t)<omega then s and t are at most 15 positions apart in Sy.",
+            order=3,
+        ),
+    ]
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=None,
+        embed_texts=need_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.95,
+        min_candidate_score=1.1,
+        use_query_need_resolver=True,
+        query_need_max_depth=0,
+        query_need_min_support_score=0.28,
+    ).assemble(make_document(elements), "Why is the merge step linear?")
+
+    assert result.query_need_packages
+    need_package = result.query_need_packages[0]
+    assert need_package.resolved_needs
+    assert need_package.selected_elements == ("support",)
+    assert result.packages[0].element_ids == ["core", "support"]
+
+
+def test_consensus_knn_query_need_resolver_uses_generated_possible_need_hint():
+    elements = [
+        make_element("core", "Alpha result follows from the bounded candidate set.", order=1),
+        make_element("support", "The candidate set contains at most 15 entries.", order=2),
+        make_element("distractor", "Alpha notation appears in a diagram.", order=3),
+    ]
+    llm = PropositionLLM(
+        '{"elements":['
+        '{"element_id":"core","propositions":[{"text":"Alpha result follows from the bounded candidate set.",'
+        '"roles":[{"role":"claim","target":"Alpha result","value":"bounded candidate set","confidence":0.9,"reason":"States the result."}],'
+        '"possible_needs":[{"kind":"bound_support","question":"Why is the candidate set bounded?",'
+        '"target":"bounded candidate set","expected_support":["at most","bound"],'
+        '"anchor_terms":["candidate set","bounded"],"confidence":0.9,"reason":"The result depends on the bound."}]}]},'
+        '{"element_id":"support","propositions":[{"text":"The candidate set contains at most 15 entries.",'
+        '"roles":[{"role":"quantity_bound","target":"candidate set","value":"at most 15 entries","confidence":0.9,"reason":"States the bound."}],'
+        '"possible_needs":[]}]},'
+        '{"element_id":"distractor","propositions":[{"text":"Alpha notation appears in a diagram.",'
+        '"roles":[{"role":"visual_support","target":"Alpha notation","value":"diagram","confidence":0.9,"reason":"Mentions a visual."}],'
+        '"possible_needs":[]}]}'
+        ']}'
+    )
+
+    result = ConsensusKnnPropositionEvidenceAssembler(
+        llm_client=llm,
+        embed_texts=need_embed,
+        top_k_cores=1,
+        max_side_elements=0,
+        k_values=(1,),
+        min_neighbor_stability=1.0,
+        min_edge_similarity=0.95,
+        min_candidate_score=1.1,
+        use_query_need_resolver=True,
+        query_need_max_depth=0,
+        query_need_min_support_score=0.25,
+    ).assemble(make_document(elements), "Why does the alpha result hold?")
+
+    assert result.query_need_packages
+    need_package = result.query_need_packages[0]
+    assert [need.kind for need in need_package.active_needs] == ["bound_support"]
+    assert need_package.selected_elements == ("support",)
+    assert result.packages[0].element_ids == ["core", "support"]
 
 
 def test_consensus_knn_assembler_builds_multi_anchor_package_from_query_sub_needs():
